@@ -295,11 +295,53 @@ def deposit():
 
 @app.route('/api/faces', methods=['GET'])
 def get_faces():
+    category = request.args.get('category', 'all')
+    limit = request.args.get('limit', 50, type=int)
+    offset = request.args.get('offset', 0, type=int)
+
     conn = sqlite3.connect(str(DB_PATH)); conn.row_factory = sqlite3.Row
     c = conn.cursor()
-    c.execute("SELECT id, name, description, is_celebrity, original_price, ai_declaration, usage_count FROM faces WHERE status='active'")
-    rows = c.fetchall(); conn.close()
-    return jsonify([dict(r) for r in rows])
+
+    if category == 'celebrity':
+        c.execute("SELECT id, name, description, is_celebrity, original_price, ai_declaration, usage_count FROM faces WHERE status='active' AND is_celebrity=1 LIMIT ? OFFSET ?", (limit, offset))
+    elif category == 'normal':
+        c.execute("SELECT id, name, description, is_celebrity, original_price, ai_declaration, usage_count FROM faces WHERE status='active' AND is_celebrity=0 LIMIT ? OFFSET ?", (limit, offset))
+    else:
+        c.execute("SELECT id, name, description, is_celebrity, original_price, ai_declaration, usage_count FROM faces WHERE status='active' LIMIT ? OFFSET ?", (limit, offset))
+
+    rows = c.fetchall()
+
+    # total count
+    if category == 'celebrity':
+        c.execute("SELECT COUNT(*) FROM faces WHERE status='active' AND is_celebrity=1")
+    elif category == 'normal':
+        c.execute("SELECT COUNT(*) FROM faces WHERE status='active' AND is_celebrity=0")
+    else:
+        c.execute("SELECT COUNT(*) FROM faces WHERE status='active'")
+    total = c.fetchone()[0]
+
+    conn.close()
+    return jsonify({"faces": [dict(r) for r in rows], "total": total, "limit": limit, "offset": offset})
+
+
+@app.route('/api/faces/search', methods=['GET'])
+def search_faces():
+    q = request.args.get('q', '').strip()
+    limit = request.args.get('limit', 50, type=int)
+    offset = request.args.get('offset', 0, type=int)
+
+    if not q:
+        return jsonify({"error": "请提供搜索关键词"}), 400
+
+    conn = sqlite3.connect(str(DB_PATH)); conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    pattern = f"%{q}%"
+    c.execute("SELECT id, name, description, is_celebrity, original_price, ai_declaration, usage_count FROM faces WHERE status='active' AND name LIKE ? LIMIT ? OFFSET ?", (pattern, limit, offset))
+    rows = c.fetchall()
+    c.execute("SELECT COUNT(*) FROM faces WHERE status='active' AND name LIKE ?", (pattern,))
+    total = c.fetchone()[0]
+    conn.close()
+    return jsonify({"faces": [dict(r) for r in rows], "total": total, "limit": limit, "offset": offset, "query": q})
 
 @app.route('/api/faces', methods=['POST'])
 def add_face():
