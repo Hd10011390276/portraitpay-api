@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """PortraitPay AI Backend - 肖像版权数据库系统"""
 
-import os, json, sqlite3, hashlib, time, secrets, logging
+import os, json, sqlite3, hashlib, time, secrets, logging, smtplib, random, string
 from datetime import datetime
 from pathlib import Path
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
@@ -24,6 +26,41 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 
 app = Flask(__name__)
 CORS(app)
+
+# Email configuration (from environment variables)
+SMTP_HOST = os.environ.get('SMTP_HOST', 'smtp.exmail.qq.com')
+SMTP_PORT = int(os.environ.get('SMTP_PORT', 465))
+SMTP_USER = os.environ.get('SMTP_USER', 'Dean.hang@portraitpayai.com')
+SMTP_PASSWORD = os.environ.get('SMTP_PASSWORD', '')
+SENDER_EMAIL = SMTP_USER
+
+def generate_code(length=6):
+    return ''.join(random.choices(string.digits, k=length))
+
+def send_email(to_email, subject, body):
+    """Send email via SMTP. Returns (success, error_message)."""
+    if not SMTP_PASSWORD:
+        return False, "SMTP_PASSWORD not configured"
+    try:
+        msg = MIMEMultipart('alternative')
+        msg['Subject'] = subject
+        msg['From'] = SENDER_EMAIL
+        msg['To'] = to_email
+        msg.attach(MIMEText(body, 'plain', 'utf-8'))
+        
+        if SMTP_PORT == 465:
+            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as server:
+                server.login(SMTP_USER, SMTP_PASSWORD)
+                server.sendmail(SENDER_EMAIL, [to_email], msg.as_string())
+        else:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+                server.ehlo()
+                server.starttls()
+                server.login(SMTP_USER, SMTP_PASSWORD)
+                server.sendmail(SENDER_EMAIL, [to_email], msg.as_string())
+        return True, None
+    except Exception as e:
+        return False, str(e)
 
 # 全局错误处理
 @app.errorhandler(400)
@@ -50,6 +87,13 @@ def server_error(e):
 def init_db():
     conn = sqlite3.connect(str(DB_PATH))
     c = conn.cursor()
+    # Add new columns if they don't exist (for existing DBs)
+    for col, col_type in [('email', 'TEXT'), ('verification_code', 'TEXT'), ('verified', 'INTEGER DEFAULT 0')]:
+        try:
+            c.execute(f"ALTER TABLE users ADD COLUMN {col} {col_type}")
+        except:
+            pass  # Column already exists
+
     c.execute('''CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         username TEXT UNIQUE NOT NULL,
@@ -57,7 +101,10 @@ def init_db():
         api_key TEXT UNIQUE,
         balance REAL DEFAULT 0.0,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        is_admin INTEGER DEFAULT 0
+        is_admin INTEGER DEFAULT 0,
+        email TEXT,
+        verification_code TEXT,
+        verified INTEGER DEFAULT 0
     )''')
     c.execute('''CREATE TABLE IF NOT EXISTS faces (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -152,16 +199,70 @@ def register():
     d = request.json
     if not d.get('username') or not d.get('password'):
         return jsonify({"error": "请填写用户名和密码"}), 400
+    email = d.get('email', '').strip()
+    if not email:
+        return jsonify({"error": "请填写邮箱地址"}), 400
+    
     ph = hashlib.sha256(d['password'].encode()).hexdigest()
     ak = secrets.token_hex(16)
+    code = generate_code(6)
+    
     conn = sqlite3.connect(str(DB_PATH))
     c = conn.cursor()
     try:
-        c.execute("INSERT INTO users (username, password_hash, api_key) VALUES (?, ?, ?)",
-                 (d['username'], ph, ak))
+        # Check if user already exists
+        c.execute("SELECT id FROM users WHERE username=?", (d['username'],))
+        if c.fetchone():
+            conn.close()
+            return jsonify({"error": "用户名已存在"}), 400
+        
+        c.execute("INSERT INTO users (username, password_hash, api_key, email, verification_code, verified) VALUES (?, ?, ?, ?, ?, 0)",
+                 (d['username'], ph, ak, email, code))
         conn.commit(); uid = c.lastrowid; conn.close()
-        return jsonify({"success": True, "api_key": ak, "message": "注册成功"})
-    except: conn.close(); return jsonify({"error": "用户名已存在"}), 400
+        
+        # Send verification email
+        subject = "PortraitPay 注册验证码"
+        body = f"您的验证码是：{code}\n\n请在5分钟内完成验证。\n\n如果不是您本人注册，请忽略此邮件。"
+        ok, err = send_email(email, subject, body)
+        if not ok:
+            logger.warning(f"Failed to send verification email to {email}: {err}")
+        
+        return jsonify({"success": True, "status": "pending_verification", "message": "注册成功，请查收验证码邮件"})
+    except Exception as e:
+        conn.close()
+        logger.error(f"Registration error: {e}")
+        return jsonify({"error": "用户名已存在或注册失败"}), 400
+
+@app.route('/api/register/verify', methods=['POST'])
+def verify_registration():
+    d = request.json
+    username = d.get('username', '').strip()
+    code = d.get('code', '').strip()
+    
+    if not username or not code:
+        return jsonify({"error": "请提供用户名和验证码"}), 400
+    
+    conn = sqlite3.connect(str(DB_PATH)); conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT id, verification_code, verified FROM users WHERE username=?", (username,))
+    user = c.fetchone()
+    
+    if not user:
+        conn.close()
+        return jsonify({"error": "用户不存在"}), 404
+    
+    if user['verified']:
+        conn.close()
+        return jsonify({"error": "用户已验证"}), 400
+    
+    if user['verification_code'] != code:
+        conn.close()
+        return jsonify({"error": "验证码错误"}), 400
+    
+    c.execute("UPDATE users SET verified=1, verification_code=NULL WHERE id=?", (user['id'],))
+    conn.commit(); conn.close()
+    
+    return jsonify({"success": True, "message": "验证成功，欢迎加入PortraitPay！"})
 
 @app.route('/api/login', methods=['POST'])
 def login():
