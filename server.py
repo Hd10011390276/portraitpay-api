@@ -374,8 +374,9 @@ def register():
     if not d.get('username') or not d.get('password'):
         return jsonify({"error": "请填写用户名和密码"}), 400
     email = d.get('email', '').strip()
-    if not email:
-        return jsonify({"error": "请填写邮箱地址"}), 400
+    # Email is optional for now (email sending not yet working)
+    # if not email:
+    #     return jsonify({"error": "请填写邮箱地址"}), 400
     
     ph = hashlib.sha256(d['password'].encode()).hexdigest()
     ak = secrets.token_hex(16)
