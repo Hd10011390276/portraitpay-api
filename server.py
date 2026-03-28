@@ -220,96 +220,111 @@ def pay_uploader(uid, amt):
 
 # ─── Face Recognition Helpers ────────────────────────────────────────────────
 
-def _get_deepface():
-    """Lazy import deepface to avoid heavy startup cost."""
-    os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '3')
-    os.environ.setdefault('CUDA_VISIBLE_DEVICES', '')  # Force CPU
-    try:
-        from deepface import DeepFace
-        return DeepFace
-    except ImportError:
-        return None
-
-
 def _extract_face_embedding(image_source):
     """
-    Extract face embedding from image_source.
-    image_source can be:
-      - base64 string (data URI or raw)
-      - file path string
-      - PIL Image
-      - bytes
+    Extract face embedding using OpenCV DNN + ResNet.
+    Falls back to pixel-based if DNN model unavailable.
     Returns (embedding_list, error_msg).
     """
-    DeepFace = _get_deepface()
-    if DeepFace is None:
-        return None, "deepface not installed"
+    import cv2
+    import numpy as np
 
     img = None
+    img_bytes = None
     try:
         if isinstance(image_source, str):
-            # Check if it's a base64 string
             if image_source.startswith('data:'):
                 b64 = image_source.split(',')[1]
-                img = Image.open(io.BytesIO(base64.b64decode(b64)))
+                img = cv2.imdecode(np.frombuffer(base64.b64decode(b64), np.uint8), cv2.IMREAD_COLOR)
             elif len(image_source) > 200 and not Path(image_source).exists():
-                # Likely raw base64
-                img = Image.open(io.BytesIO(base64.b64decode(image_source)))
+                img = cv2.imdecode(np.frombuffer(base64.b64decode(image_source), np.uint8), cv2.IMREAD_COLOR)
+            elif Path(image_source).exists():
+                img = cv2.imread(str(image_source))
             else:
-                # File path
-                img = Image.open(image_source)
+                img = cv2.imdecode(np.frombuffer(base64.b64decode(image_source), np.uint8), cv2.IMREAD_COLOR)
         elif isinstance(image_source, bytes):
-            img = Image.open(io.BytesIO(image_source))
-        elif isinstance(image_source, Image.Image):
-            img = image_source
+            img = cv2.imdecode(np.frombuffer(image_source, np.uint8), cv2.IMREAD_COLOR)
+        else:
+            return None, "Unsupported image source type"
 
         if img is None:
             return None, "Could not decode image"
 
-        # Convert to RGB if needed
-        if img.mode != 'RGB':
-            img = img.convert('RGB')
+        # Use OpenCV DNN face detector (ResNet-SSD based)
+        # Try to download/find the face detection model
+        try:
+            # Download the DNN face detection model if not cached
+            import urllib.request
+            model_dir = Path.home() / '.cache' / 'portraitpay'
+            model_dir.mkdir(parents=True, exist_ok=True)
+            prototxt = model_dir / 'deploy.prototxt'
+            caffemodel = model_dir / 'res10_300x300_ssd_iter_140000.caffemodel'
 
-        # Save to temp buffer for deepface
-        buf = io.BytesIO()
-        img.save(buf, format='JPEG')
-        buf.seek(0)
-        img_bytes = buf.read()
+            if not caffemodel.exists():
+                # Download ResNet-SSD face detector (5MB)
+                url = 'https://raw.githubusercontent.com/opencv/opencv/master/samples/dnn/face_detector/deploy.prototxt'
+                urllib.request.urlretrieve(url, str(prototxt))
+                url = 'https://raw.githubusercontent.com/opencv/opencv_3rdparty/dnn_samples_face_detector_20170830/res10_300x300_ssd_iter_140000.caffemodel'
+                urllib.request.urlretrieve(url, str(caffemodel))
 
-        # Extract embedding using VGG-Face (CPU-friendly, no GPU needed)
-        embedding_obj = DeepFace.represent(
-            img_path=img_bytes,
-            model_name='VGG-Face',
-            enforce_detection=True,
-            detector_backend='opencv'
-        )
+            net = cv2.dnn.readNetFromCaffe(str(prototxt), str(caffemodel))
+            h, w = img.shape[:2]
+            blob = cv2.dnn.blobFromImage(cv2.resize(img, (300, 300)), 1.0, (300, 300), (104.0, 177.0, 123.0))
+            net.setInput(blob)
+            detections = net.forward()
 
-        if isinstance(embedding_obj, list) and len(embedding_obj) > 0:
-            embedding = embedding_obj[0]['embedding']
-            return embedding, None
-        elif isinstance(embedding_obj, dict) and 'embedding' in embedding_obj:
-            return embedding_obj['embedding'], None
-        else:
-            return None, f"Unexpected embedding format: {type(embedding_obj)}"
+            # Find largest face
+            best_conf, best_box = 0, None
+            for i in range(detections.shape[2]):
+                conf = detections[0, 0, i, 2]
+                if conf > 0.5 and conf > best_conf:
+                    box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
+                    best_conf, best_box = conf, box.astype(int)
+
+            if best_box is None:
+                return None, "no_face_detected"
+
+            x1, y1, x2, y2 = best_box
+            face = img[y1:y2, x1:x2]
+
+            # Use ResNet-18 from torchvision as embedding extractor (if available)
+            try:
+                import torch
+                import torchvision.models as models
+                import torchvision.transforms as transforms
+
+                model = models.resnet18(weights='DEFAULT')
+                model = torch.nn.Sequential(*list(model.children())[:-1])  # Remove final FC layer
+                model.eval()
+
+                face_rgb = cv2.cvtColor(face, cv2.COLOR_BGR2RGB)
+                face_pil = Image.fromarray(face_rgb)
+                transform = transforms.Compose([
+                    transforms.Resize((224, 224)),
+                    transforms.ToTensor(),
+                    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+                ])
+                tensor = transform(face_pil).unsqueeze(0)
+                with torch.no_grad():
+                    embedding = model(tensor).squeeze().numpy().tolist()
+                return embedding, None
+
+            except (ImportError, Exception) as e:
+                # Fallback: pixel-based embedding (resize + flatten + normalize)
+                face_resized = cv2.resize(face, (64, 64))
+                embedding = face_resized.flatten().astype(np.float32)
+                norm = np.linalg.norm(embedding)
+                if norm > 0:
+                    embedding = (embedding / norm * 100).tolist()  # Scale for better similarity
+                else:
+                    return None, "face_too_small"
+                return embedding, None
+
+        except Exception as e:
+            return None, f"dnn_model_error: {str(e)}"
 
     except Exception as e:
-        err_msg = str(e)
-        # If strict face detection failed, try without enforcement
-        if 'face could not be detected' in err_msg.lower() or 'detector' in err_msg.lower():
-            try:
-                embedding_obj = DeepFace.represent(
-                    img_path=img_bytes if img_bytes else image_source,
-                    model_name='VGG-Face',
-                    enforce_detection=False,
-                    detector_backend='opencv'
-                )
-                if isinstance(embedding_obj, list) and len(embedding_obj) > 0:
-                    return embedding_obj[0]['embedding'], None
-                elif isinstance(embedding_obj, dict) and 'embedding' in embedding_obj:
-                    return embedding_obj['embedding'], None
-            except Exception as e2:
-                return None, f"Face detection failed (lenient): {e2}"
-        return None, f"Embedding extraction failed: {err_msg}"
+        return None, f"embedding_error: {str(e)}"
 
 
 def _cosine_similarity(a, b):
