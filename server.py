@@ -812,15 +812,19 @@ def register_face_embedding():
         if not image_data:
             return jsonify({"error": "缺少图片"}), 400
 
-        # Verify the face belongs to this user
+        # Verify the face exists
         conn = sqlite3.connect(str(DB_PATH))
         conn.row_factory = sqlite3.Row
         c = conn.cursor()
-        c.execute("SELECT * FROM faces WHERE id=? AND uploader_id=?", (face_id, int(user['id'])))
+        c.execute("SELECT * FROM faces WHERE id=? AND status='active'", (face_id,))
         face = c.fetchone()
         conn.close()
 
         if not face:
+            return jsonify({"error": "肖像不存在"}), 404
+
+        # Check uploader_id matches, but if no uploader_id set (legacy), allow anyway
+        if face['uploader_id'] is not None and face['uploader_id'] != int(user['id']):
             return jsonify({"error": "肖像不存在或无权操作"}), 404
 
         # Extract embedding
