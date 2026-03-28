@@ -857,7 +857,12 @@ def debug_whoami():
     user = get_user(api_key)
     if not user:
         return jsonify({"error": "invalid"}), 401
-    return jsonify(dict(user), api_key=api_key)
+    # Explicitly pick serializable fields only
+    return jsonify({
+        "id": int(user['id']),
+        "username": str(user['username']),
+        "api_key": api_key
+    })
 
 @app.route('/api/faces/list-embeddings', methods=['GET'])
 def list_face_embeddings():
