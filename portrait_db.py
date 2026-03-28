@@ -60,6 +60,10 @@ def last_insert_id(_conn, _cursor, _is_pg):
     _cursor.execute("SELECT last_insert_rowid()")
     return _cursor.fetchone()[0]
 
+def dict_from_row(row):
+    """Alias for row_to_dict for backward compatibility."""
+    return row_to_dict(row)
+
 def row_to_dict(row):
     if row is None:
         return None
@@ -69,6 +73,9 @@ def row_to_dict(row):
         return dict(zip(row.keys(), [row[k] for k in row.keys()]))
     except Exception:
         return str(row)
+
+# Backward compatibility alias
+dict_from_row = row_to_dict
 
 # ── Schema definitions ────────────────────────────────────────────────────────
 _PG_SCHEMA = {
