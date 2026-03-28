@@ -223,7 +223,7 @@ def pay_uploader(uid, amt):
 
 def _extract_face_embedding(image_source):
     """
-    Extract face embedding using OpenCV.
+    Extract face embedding using OpenCV (pure Python, no external model files needed).
     Falls back gracefully to resize-based features if any step fails.
     Returns (embedding_list, error_msg).
     """
@@ -239,14 +239,12 @@ def _extract_face_embedding(image_source):
         if face.size == 0:
             return None
         gray = cv2.cvtColor(face, cv2.COLOR_BGR2GRAY)
-
-        # 1. Color histogram (HSV, 32 bins each channel)
         hsv = cv2.cvtColor(face, cv2.COLOR_BGR2HSV)
+
         hist_h = cv2.calcHist([hsv], [0], None, [32], [0, 180]).flatten()
         hist_s = cv2.calcHist([hsv], [1], None, [32], [0, 256]).flatten()
         hist_v = cv2.calcHist([hsv], [2], None, [32], [0, 256]).flatten()
 
-        # 2. HOG-like gradient features
         gray_small = cv2.resize(gray, (64, 64))
         sobelx = cv2.Sobel(gray_small, cv2.CV_64F, 1, 0, ksize=3)
         sobely = cv2.Sobel(gray_small, cv2.CV_64F, 0, 1, ksize=3)
@@ -260,11 +258,8 @@ def _extract_face_embedding(image_source):
                 h, _ = np.histogram(ca.ravel(), bins=9, range=(-np.pi, np.pi), weights=cm.ravel())
                 hog.extend(h)
         hog = np.array(hog, dtype=np.float32)
-
-        # 3. Downsampled pixel features
         pixels = cv2.resize(gray, (32, 32)).flatten().astype(np.float32)
 
-        # Combine and normalize
         color_feat = norm(np.concatenate([hist_h, hist_s, hist_v]).astype(np.float32))
         hog_feat = norm(hog)
         pixel_feat = norm(pixels)
@@ -274,66 +269,62 @@ def _extract_face_embedding(image_source):
     # ---- Decode image ----
     img = None
     img_bytes = None
+    if isinstance(image_source, str):
+        if image_source.startswith('data:'):
+            b64 = image_source.split(',')[1]
+            img_bytes = base64.b64decode(b64)
+        elif len(image_source) > 200 and not Path(image_source).exists():
+            img_bytes = base64.b64decode(image_source)
+        elif Path(image_source).exists():
+            img = cv2.imread(str(image_source))
+        else:
+            img_bytes = base64.b64decode(image_source)
+    elif isinstance(image_source, bytes):
+        img_bytes = image_source
+
+    if img is None and img_bytes:
+        img = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        return None, "Could not decode image"
+
+    # ---- Try DNN face detection (model cached locally) ----
     try:
-        if isinstance(image_source, str):
-            if image_source.startswith('data:'):
-                b64 = image_source.split(',')[1]
-                img_bytes = base64.b64decode(b64)
-            elif len(image_source) > 200 and not Path(image_source).exists():
-                img_bytes = base64.b64decode(image_source)
-            elif Path(image_source).exists():
-                img = cv2.imread(str(image_source))
-            else:
-                img_bytes = base64.b64decode(image_source)
-        elif isinstance(image_source, bytes):
-            img_bytes = image_source
+        model_dir = Path.home() / '.cache' / 'portraitpay'
+        model_dir.mkdir(parents=True, exist_ok=True)
+        prototxt = model_dir / 'deploy.prototxt'
+        caffemodel = model_dir / 'res10_300x300_ssd_iter_140000.caffemodel'
 
-        if img is None and img_bytes:
-            img = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
-        if img is None:
-            return None, "Could not decode image"
-
-        # ---- Try DNN face detection ----
-        try:
-            model_dir = Path.home() / '.cache' / 'portraitpay'
-            model_dir.mkdir(parents=True, exist_ok=True)
-            prototxt = model_dir / 'deploy.prototxt'
-            caffemodel = model_dir / 'res10_300x300_ssd_iter_140000.caffemodel'
-
-            if caffemodel.exists() and prototxt.exists():
-                net = cv2.dnn.readNetFromCaffe(str(prototxt), str(caffemodel))
-                h, w = img.shape[:2]
-                blob = cv2.dnn.blobFromImage(cv2.resize(img, (300, 300)), 1.0, (300, 300), (104.0, 177.0, 123.0))
-                net.setInput(blob)
-                detections = net.forward()
-                best_conf, best_box = 0, None
-                for i in range(detections.shape[2]):
-                    conf = detections[0, 0, i, 2]
-                    if conf > 0.5 and conf > best_conf:
-                        box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
-                        best_conf, best_box = conf, box.astype(int)
-                if best_box is not None:
-                    x1, y1, x2, y2 = best_box
-                    face = img[y1:y2, x1:x2]
-                    emb = extract_from_face(face)
-                    if emb:
-                        return emb, None
-        except Exception:
-            pass  # DNN failed, fall through to simple crop
-
-        # ---- Fallback: center crop + resize ----
-        h, w = img.shape[:2]
-        crop_size = min(h, w)
-        y_offset = (h - crop_size) // 2
-        x_offset = (w - crop_size) // 2
-        face = img[y_offset:y_offset+crop_size, x_offset:x_offset+crop_size]
-        emb = extract_from_face(face)
-        if emb:
-            return emb, None
-        return None, "embedding extraction failed"
-
+        if caffemodel.exists() and prototxt.exists():
+            net = cv2.dnn.readNetFromCaffe(str(prototxt), str(caffemodel))
+            h, w = img.shape[:2]
+            blob = cv2.dnn.blobFromImage(cv2.resize(img, (300, 300)), 1.0, (300, 300), (104.0, 177.0, 123.0))
+            net.setInput(blob)
+            detections = net.forward()
+            best_conf, best_box = 0, None
+            for i in range(detections.shape[2]):
+                conf = detections[0, 0, i, 2]
+                if conf > 0.5 and conf > best_conf:
+                    box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
+                    best_conf, best_box = conf, box.astype(int)
+            if best_box is not None:
+                x1, y1, x2, y2 = best_box
+                face = img[y1:y2, x1:x2]
+                emb = extract_from_face(face)
+                if emb:
+                    return emb, None
     except Exception as e:
-        return None, f"embedding_error: {str(e)}"
+        logger.warning(f"DNN detection skipped/failed: {e}")
+
+    # ---- Fallback: center crop + resize ----
+    h, w = img.shape[:2]
+    crop_size = min(h, w)
+    y_offset = (h - crop_size) // 2
+    x_offset = (w - crop_size) // 2
+    face = img[y_offset:y_offset+crop_size, x_offset:x_offset+crop_size]
+    emb = extract_from_face(face)
+    if emb:
+        return emb, None
+    return None, "embedding extraction failed"
 
 
 def _cosine_similarity(a, b):
@@ -794,52 +785,54 @@ def register_face_embedding():
     Register a face with its embedding.
     Body: { face_id: int, image: base64_string }
     """
-    api_key = request.headers.get('X-API-Key')
-    user = get_user(api_key)
-    if not user:
-        return jsonify({"error": "请先登录"}), 401
-    
-    data = request.json
-    face_id = data.get('face_id')
-    image_data = data.get('image')
-    
-    if not face_id:
-        return jsonify({"error": "缺少face_id"}), 400
-    if not image_data:
-        return jsonify({"error": "缺少图片"}), 400
-    
-    # Verify the face belongs to this user
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute("SELECT * FROM faces WHERE id=? AND uploader_id=?", (face_id, user['id']))
-    face = c.fetchone()
-    conn.close()
-    
-    if not face:
-        return jsonify({"error": "肖像不存在或无权操作"}), 404
-    
-    # Extract embedding
-    embedding, err = _extract_face_embedding(image_data)
-    if err:
-        logger.error(f"Embedding extraction failed for face_id {face_id}: {err}")
-        return jsonify({"error": f"人脸识别失败: {err}"}), 422
-    
-    # Store embedding
-    import pickle
-    conn = sqlite3.connect(str(DB_PATH))
-    c = conn.cursor()
-    # Remove existing embedding for this face
-    c.execute("DELETE FROM face_embeddings WHERE face_id=?", (face_id,))
-    # Store new embedding
-    c.execute("INSERT INTO face_embeddings (face_id, embedding, model_name) VALUES (?, ?, ?)",
-               (face_id, pickle.dumps(embedding), 'VGG-Face'))
-    conn.commit()
-    conn.close()
-    
-    logger.info(f"Stored embedding for face_id {face_id} by user {user['id']}")
-    return jsonify({"success": True, "face_id": face_id, "embedding_dim": len(embedding)})
+    try:
+        api_key = request.headers.get('X-API-Key')
+        user = get_user(api_key)
+        if not user:
+            return jsonify({"error": "请先登录"}), 401
 
+        data = request.json
+        face_id = data.get('face_id')
+        image_data = data.get('image')
+
+        if not face_id:
+            return jsonify({"error": "缺少face_id"}), 400
+        if not image_data:
+            return jsonify({"error": "缺少图片"}), 400
+
+        # Verify the face belongs to this user
+        conn = sqlite3.connect(str(DB_PATH))
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM faces WHERE id=? AND uploader_id=?", (face_id, user['id']))
+        face = c.fetchone()
+        conn.close()
+
+        if not face:
+            return jsonify({"error": "肖像不存在或无权操作"}), 404
+
+        # Extract embedding
+        embedding, err = _extract_face_embedding(image_data)
+        if err:
+            logger.error(f"Embedding extraction failed for face_id {face_id}: {err}")
+            return jsonify({"error": f"人脸识别失败: {err}"}), 422
+
+        # Store embedding
+        import pickle
+        conn = sqlite3.connect(str(DB_PATH))
+        c = conn.cursor()
+        c.execute("DELETE FROM face_embeddings WHERE face_id=?", (face_id,))
+        c.execute("INSERT INTO face_embeddings (face_id, embedding, model_name) VALUES (?, ?, ?)",
+                   (face_id, pickle.dumps(embedding), 'hist-hog-pixel'))
+        conn.commit()
+        conn.close()
+
+        logger.info(f"Stored embedding for face_id {face_id} by user {user['id']}")
+        return jsonify({"success": True, "face_id": face_id, "embedding_dim": len(embedding)})
+    except Exception as e:
+        import traceback
+        logger.error(f"Register embedding error: {e}\n{traceback.format_exc()}")
+        return jsonify({"error": f"服务器错误: {str(e)}"}), 500
 
 @app.route('/api/faces/list-embeddings', methods=['GET'])
 def list_face_embeddings():
