@@ -779,6 +779,18 @@ def llm_verify():
     })
 
 
+@app.route('/api/debug/face/<int:fid>', methods=['GET'])
+def debug_face(fid):
+    """Debug endpoint to check face uploader_id."""
+    conn = sqlite3.connect(str(DB_PATH)); conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT * FROM faces WHERE id=?", (fid,))
+    face = c.fetchone()
+    conn.close()
+    if not face:
+        return jsonify({"error": "not found"}), 404
+    return jsonify(dict(face))
+
 @app.route('/api/faces/register-embedding', methods=['POST'])
 def register_face_embedding():
     """
@@ -804,7 +816,7 @@ def register_face_embedding():
         conn = sqlite3.connect(str(DB_PATH))
         conn.row_factory = sqlite3.Row
         c = conn.cursor()
-        c.execute("SELECT * FROM faces WHERE id=? AND uploader_id=?", (face_id, user['id']))
+        c.execute("SELECT * FROM faces WHERE id=? AND uploader_id=?", (face_id, int(user['id'])))
         face = c.fetchone()
         conn.close()
 
