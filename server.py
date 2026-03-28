@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """PortraitPay AI Backend - 肖像版权数据库系统"""
 
-import os, json, sqlite3, hashlib, time, secrets, logging, smtplib, random, string
+import os, json, sqlite3, hashlib, time, secrets, logging, smtplib, random, string, base64, io
 from datetime import datetime
 from pathlib import Path
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from PIL import Image
 
 # 配置日志
 logging.basicConfig(
@@ -156,6 +157,28 @@ def init_db():
         uploader_id INTEGER,
         timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )''')
+    # Face embeddings for real face recognition
+    c.execute('''CREATE TABLE IF NOT EXISTS face_embeddings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        face_id INTEGER NOT NULL,
+        embedding BLOB NOT NULL,
+        model_name TEXT DEFAULT 'VGG-Face',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (face_id) REFERENCES faces(id)
+    )''')
+    # Ensure image_path column exists
+    try:
+        c.execute("ALTER TABLE faces ADD COLUMN image_path TEXT")
+    except:
+        pass
+    try:
+        c.execute("ALTER TABLE faces ADD COLUMN id_image_path TEXT")
+    except:
+        pass
+    try:
+        c.execute("ALTER TABLE faces ADD COLUMN age INTEGER DEFAULT 0")
+    except:
+        pass
     c.execute("SELECT COUNT(*) FROM users WHERE is_admin=1")
     if c.fetchone()[0] == 0:
         h = hashlib.sha256("admin123".encode()).hexdigest()
@@ -193,6 +216,157 @@ def pay_uploader(uid, amt):
     c.execute("INSERT INTO revenues (source_type, amount, platform_fee, uploader_id) VALUES (?, ?, ?, ?)",
              ("query", amt, fee, uid))
     conn.commit(); conn.close()
+
+
+# ─── Face Recognition Helpers ────────────────────────────────────────────────
+
+def _get_deepface():
+    """Lazy import deepface to avoid heavy startup cost."""
+    os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '3')
+    os.environ.setdefault('CUDA_VISIBLE_DEVICES', '')  # Force CPU
+    try:
+        from deepface import DeepFace
+        return DeepFace
+    except ImportError:
+        return None
+
+
+def _extract_face_embedding(image_source):
+    """
+    Extract face embedding from image_source.
+    image_source can be:
+      - base64 string (data URI or raw)
+      - file path string
+      - PIL Image
+      - bytes
+    Returns (embedding_list, error_msg).
+    """
+    DeepFace = _get_deepface()
+    if DeepFace is None:
+        return None, "deepface not installed"
+
+    img = None
+    try:
+        if isinstance(image_source, str):
+            # Check if it's a base64 string
+            if image_source.startswith('data:'):
+                b64 = image_source.split(',')[1]
+                img = Image.open(io.BytesIO(base64.b64decode(b64)))
+            elif len(image_source) > 200 and not Path(image_source).exists():
+                # Likely raw base64
+                img = Image.open(io.BytesIO(base64.b64decode(image_source)))
+            else:
+                # File path
+                img = Image.open(image_source)
+        elif isinstance(image_source, bytes):
+            img = Image.open(io.BytesIO(image_source))
+        elif isinstance(image_source, Image.Image):
+            img = image_source
+
+        if img is None:
+            return None, "Could not decode image"
+
+        # Convert to RGB if needed
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+
+        # Save to temp buffer for deepface
+        buf = io.BytesIO()
+        img.save(buf, format='JPEG')
+        buf.seek(0)
+        img_bytes = buf.read()
+
+        # Extract embedding using VGG-Face (CPU-friendly, no GPU needed)
+        embedding_obj = DeepFace.represent(
+            img_path=img_bytes,
+            model_name='VGG-Face',
+            enforce_detection=True,
+            detector_backend='opencv'
+        )
+
+        if isinstance(embedding_obj, list) and len(embedding_obj) > 0:
+            embedding = embedding_obj[0]['embedding']
+            return embedding, None
+        elif isinstance(embedding_obj, dict) and 'embedding' in embedding_obj:
+            return embedding_obj['embedding'], None
+        else:
+            return None, f"Unexpected embedding format: {type(embedding_obj)}"
+
+    except Exception as e:
+        err_msg = str(e)
+        # If strict face detection failed, try without enforcement
+        if 'face could not be detected' in err_msg.lower() or 'detector' in err_msg.lower():
+            try:
+                embedding_obj = DeepFace.represent(
+                    img_path=img_bytes if img_bytes else image_source,
+                    model_name='VGG-Face',
+                    enforce_detection=False,
+                    detector_backend='opencv'
+                )
+                if isinstance(embedding_obj, list) and len(embedding_obj) > 0:
+                    return embedding_obj[0]['embedding'], None
+                elif isinstance(embedding_obj, dict) and 'embedding' in embedding_obj:
+                    return embedding_obj['embedding'], None
+            except Exception as e2:
+                return None, f"Face detection failed (lenient): {e2}"
+        return None, f"Embedding extraction failed: {err_msg}"
+
+
+def _cosine_similarity(a, b):
+    """Compute cosine similarity between two embedding vectors."""
+    import math
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(x * x for x in b))
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+def _find_matching_faces(embedding, threshold=0.35, top_k=5):
+    """
+    Find matching faces from the database.
+    Returns list of dicts with face_id, name, similarity score.
+    """
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("""
+        SELECT fe.id, fe.face_id, fe.embedding, f.name, f.is_celebrity,
+               f.original_price, f.copyright_info, f.image_path
+        FROM face_embeddings fe
+        JOIN faces f ON fe.face_id = f.id
+        WHERE f.status = 'active'
+    """)
+    rows = c.fetchall()
+    conn.close()
+
+    matches = []
+    for row in rows:
+        try:
+            stored_emb = json.loads(row['embedding'])
+        except (json.JSONDecodeError, TypeError):
+            try:
+                import pickle
+                stored_emb = pickle.loads(row['embedding'])
+            except Exception:
+                continue
+
+        sim = _cosine_similarity(embedding, stored_emb)
+        if sim >= threshold:
+            matches.append({
+                'face_id': row['face_id'],
+                'name': row['name'],
+                'is_celebrity': bool(row['is_celebrity']),
+                'similarity': round(float(sim), 4),
+                'price': row['original_price'] or 0,
+                'copyright_info': row['copyright_info'],
+                'image_path': row['image_path']
+            })
+
+    # Sort by similarity descending
+    matches.sort(key=lambda x: x['similarity'], reverse=True)
+    return matches[:top_k]
 
 @app.route('/api/register', methods=['POST'])
 def register():
@@ -555,28 +729,6 @@ if __name__ == '__main__':
     logger.info("PortraitPay AI starting on port 5000...")
     app.run(host='0.0.0.0', port=5000, debug=True)
 
-@app.route('/api/llm/portrait-check', methods=['POST'])
-def llm_portrait_check():
-    """AI模型调用的肖像检查接口"""
-    data = request.json
-    prompt = data.get('prompt', '')
-    
-    # 检查是否涉及人脸/肖像
-    face_keywords = ['脸', '肖像', '人物', '明星', '演员', '人像', '照片', 'face', 'portrait', 'celebrity']
-    
-    needs_check = any(kw in prompt.lower() for kw in face_keywords)
-    
-    if not needs_check:
-        return jsonify({"needs_permission": False, "message": "不涉及肖像"})
-    
-    # 返回需要授权提示
-    return jsonify({
-        "needs_permission": True,
-        "message": "检测到可能涉及肖像的内容，请先查询PortraitHub获取授权",
-        "api_endpoint": "/api/faces",
-        "license_info": "请联系肖像所有者获取授权"
-    })
-
 @app.route('/api/llm/verify', methods=['POST'])
 def llm_verify():
     """验证肖像使用权"""
@@ -608,6 +760,185 @@ def llm_verify():
         "authorized": price == 0,
         "usage_purpose": usage_purpose,
         "license": f"PortraitHub License - {usage_purpose}"
+    })
+
+
+@app.route('/api/faces/register-embedding', methods=['POST'])
+def register_face_embedding():
+    """
+    Register a face with its embedding.
+    Body: { face_id: int, image: base64_string }
+    """
+    api_key = request.headers.get('X-API-Key')
+    user = get_user(api_key)
+    if not user:
+        return jsonify({"error": "请先登录"}), 401
+    
+    data = request.json
+    face_id = data.get('face_id')
+    image_data = data.get('image')
+    
+    if not face_id:
+        return jsonify({"error": "缺少face_id"}), 400
+    if not image_data:
+        return jsonify({"error": "缺少图片"}), 400
+    
+    # Verify the face belongs to this user
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT * FROM faces WHERE id=? AND uploader_id=?", (face_id, user['id']))
+    face = c.fetchone()
+    conn.close()
+    
+    if not face:
+        return jsonify({"error": "肖像不存在或无权操作"}), 404
+    
+    # Extract embedding
+    embedding, err = _extract_face_embedding(image_data)
+    if err:
+        logger.error(f"Embedding extraction failed for face_id {face_id}: {err}")
+        return jsonify({"error": f"人脸识别失败: {err}"}), 422
+    
+    # Store embedding
+    import pickle
+    conn = sqlite3.connect(str(DB_PATH))
+    c = conn.cursor()
+    # Remove existing embedding for this face
+    c.execute("DELETE FROM face_embeddings WHERE face_id=?", (face_id,))
+    # Store new embedding
+    c.execute("INSERT INTO face_embeddings (face_id, embedding, model_name) VALUES (?, ?, ?)",
+               (face_id, pickle.dumps(embedding), 'VGG-Face'))
+    conn.commit()
+    conn.close()
+    
+    logger.info(f"Stored embedding for face_id {face_id} by user {user['id']}")
+    return jsonify({"success": True, "face_id": face_id, "embedding_dim": len(embedding)})
+
+
+@app.route('/api/faces/list-embeddings', methods=['GET'])
+def list_face_embeddings():
+    """
+    List all faces that have embeddings registered.
+    """
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("""
+        SELECT f.id, f.name, f.is_celebrity, f.original_price, f.image_path,
+               fe.model_name, fe.created_at
+        FROM face_embeddings fe
+        JOIN faces f ON fe.face_id = f.id
+        WHERE f.status = 'active'
+    """)
+    rows = c.fetchall()
+    conn.close()
+    
+    return jsonify({
+        "faces": [dict(r) for r in rows],
+        "total": len(rows)
+    })
+
+
+@app.route('/api/faces/match', methods=['POST'])
+def match_face():
+    """
+    Match a face image against registered faces.
+    Body: { image: base64_string, threshold: 0.35 (optional) }
+    Returns matched faces sorted by similarity.
+    """
+    data = request.json
+    image_data = data.get('image')
+    threshold = float(data.get('threshold', 0.35))
+    
+    if not image_data:
+        return jsonify({"error": "缺少图片"}), 400
+    
+    # Extract embedding from provided image
+    embedding, err = _extract_face_embedding(image_data)
+    if err:
+        logger.error(f"Embedding extraction failed in match: {err}")
+        return jsonify({"error": f"人脸识别失败: {err}"}), 422
+    
+    # Find matches
+    matches = _find_matching_faces(embedding, threshold=threshold)
+    
+    return jsonify({
+        "matches": matches,
+        "total_matches": len(matches),
+        "threshold": threshold,
+        "embedding_dim": len(embedding)
+    })
+
+
+@app.route('/api/llm/portrait-check', methods=['POST'])
+def llm_portrait_check():
+    """
+    REAL face recognition endpoint.
+    Accepts an image and checks if it matches any registered celebrity/public faces.
+    Also accepts a text prompt for keyword-based checks.
+    """
+    data = request.json
+    image_data = data.get('image')
+    prompt = data.get('prompt', '')
+    
+    # If image is provided, do real face matching
+    if image_data:
+        embedding, err = _extract_face_embedding(image_data)
+        if err:
+            logger.warning(f"Face detection failed: {err}")
+            return jsonify({
+                "needs_permission": True,
+                "source": "detection_failed",
+                "message": f"无法检测到人脸: {err}",
+                "recommendation": "请确保图片中包含清晰的人脸"
+            })
+        
+        matches = _find_matching_faces(embedding, threshold=0.35)
+        
+        if not matches:
+            return jsonify({
+                "needs_permission": False,
+                "source": "no_match",
+                "message": "未匹配到已注册肖像，可自由使用"
+            })
+        
+        # Get best match
+        best = matches[0]
+        return jsonify({
+            "needs_permission": True,
+            "source": "face_recognition",
+            "match": best,
+            "all_matches": matches,
+            "message": f"检测到与 {best['name']} 相似的人脸，需要授权",
+            "recommendation": f"请通过 PortraitHub 获取 {best['name']} 的授权"
+        })
+    
+    # Text-only prompt: keyword matching
+    face_keywords = ['脸', '肖像', '人物', '明星', '演员', '人像', '照片', 'face', 'portrait', 'celebrity', '人物照', '照片']
+    celebrity_keywords = ['明星', '演员', '歌手', '名人', 'celebrity', 'actor', 'actress', 'singer']
+    
+    prompt_lower = prompt.lower()
+    is_celebrity = any(kw in prompt_lower for kw in celebrity_keywords)
+    
+    if any(kw in prompt_lower for kw in face_keywords):
+        if is_celebrity:
+            return jsonify({
+                "needs_permission": True,
+                "source": "keyword_celebrity",
+                "message": "检测到可能涉及明星/公众人物肖像，建议获取授权"
+            })
+        else:
+            return jsonify({
+                "needs_permission": True,
+                "source": "keyword_generic",
+                "message": "检测到可能涉及人物肖像内容"
+            })
+    
+    return jsonify({
+        "needs_permission": False,
+        "source": "no_face_detected",
+        "message": "未检测到人脸相关内容"
     })
 
 @app.route('/api/upload/portrait', methods=['POST'])
