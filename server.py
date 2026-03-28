@@ -834,6 +834,15 @@ def register_face_embedding():
         logger.error(f"Register embedding error: {e}\n{traceback.format_exc()}")
         return jsonify({"error": f"服务器错误: {str(e)}"}), 500
 
+
+@app.route('/api/debug/whoami', methods=['GET'])
+def debug_whoami():
+    api_key = request.headers.get('X-API-Key')
+    user = get_user(api_key)
+    if not user:
+        return jsonify({"error": "invalid"}), 401
+    return jsonify({"user_id": user.get('id'), "username": user.get('username'), "api_key": api_key})
+
 @app.route('/api/faces/list-embeddings', methods=['GET'])
 def list_face_embeddings():
     """
