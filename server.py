@@ -17,7 +17,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DATA_DIR = Path(__file__).parent / "data"
+# Use Railway persistent disk if available, otherwise local data/
+DATA_DIR = Path(os.environ.get("RAILWAY_PRIVATE_DIR", str(Path(__file__).parent / "data")))
 DB_PATH = DATA_DIR / "portraitpay.db"
 UPLOAD_DIR = DATA_DIR / "uploads"
 PLATFORM_FEE = 0.01
@@ -222,121 +223,114 @@ def pay_uploader(uid, amt):
 
 def _extract_face_embedding(image_source):
     """
-    Extract face embedding using OpenCV DNN face detection + histogram+HOG features.
-    Lightweight, no heavy ML dependencies needed.
+    Extract face embedding using OpenCV.
+    Falls back gracefully to resize-based features if any step fails.
     Returns (embedding_list, error_msg).
     """
     import cv2
     import numpy as np
 
+    def norm(x):
+        n = np.linalg.norm(x)
+        return (x / n) if n > 0 else x
+
+    def extract_from_face(face):
+        """Extract embedding from a cropped face image."""
+        if face.size == 0:
+            return None
+        gray = cv2.cvtColor(face, cv2.COLOR_BGR2GRAY)
+
+        # 1. Color histogram (HSV, 32 bins each channel)
+        hsv = cv2.cvtColor(face, cv2.COLOR_BGR2HSV)
+        hist_h = cv2.calcHist([hsv], [0], None, [32], [0, 180]).flatten()
+        hist_s = cv2.calcHist([hsv], [1], None, [32], [0, 256]).flatten()
+        hist_v = cv2.calcHist([hsv], [2], None, [32], [0, 256]).flatten()
+
+        # 2. HOG-like gradient features
+        gray_small = cv2.resize(gray, (64, 64))
+        sobelx = cv2.Sobel(gray_small, cv2.CV_64F, 1, 0, ksize=3)
+        sobely = cv2.Sobel(gray_small, cv2.CV_64F, 0, 1, ksize=3)
+        magnitude = np.sqrt(sobelx**2 + sobely**2)
+        angle = np.arctan2(sobely, sobelx)
+        hog = []
+        for cy in range(8):
+            for cx in range(8):
+                cm = magnitude[cy*8:(cy+1)*8, cx*8:(cx+1)*8]
+                ca = angle[cy*8:(cy+1)*8, cx*8:(cx+1)*8]
+                h, _ = np.histogram(ca.ravel(), bins=9, range=(-np.pi, np.pi), weights=cm.ravel())
+                hog.extend(h)
+        hog = np.array(hog, dtype=np.float32)
+
+        # 3. Downsampled pixel features
+        pixels = cv2.resize(gray, (32, 32)).flatten().astype(np.float32)
+
+        # Combine and normalize
+        color_feat = norm(np.concatenate([hist_h, hist_s, hist_v]).astype(np.float32))
+        hog_feat = norm(hog)
+        pixel_feat = norm(pixels)
+        embedding = np.concatenate([color_feat * 0.2, hog_feat * 0.4, pixel_feat * 0.4])
+        return norm(embedding).tolist()
+
+    # ---- Decode image ----
     img = None
+    img_bytes = None
     try:
         if isinstance(image_source, str):
             if image_source.startswith('data:'):
                 b64 = image_source.split(',')[1]
-                img = cv2.imdecode(np.frombuffer(base64.b64decode(b64), np.uint8), cv2.IMREAD_COLOR)
+                img_bytes = base64.b64decode(b64)
             elif len(image_source) > 200 and not Path(image_source).exists():
-                img = cv2.imdecode(np.frombuffer(base64.b64decode(image_source), np.uint8), cv2.IMREAD_COLOR)
+                img_bytes = base64.b64decode(image_source)
             elif Path(image_source).exists():
                 img = cv2.imread(str(image_source))
             else:
-                img = cv2.imdecode(np.frombuffer(base64.b64decode(image_source), np.uint8), cv2.IMREAD_COLOR)
+                img_bytes = base64.b64decode(image_source)
         elif isinstance(image_source, bytes):
-            img = cv2.imdecode(np.frombuffer(image_source, np.uint8), cv2.IMREAD_COLOR)
-        else:
-            return None, "Unsupported image source type"
+            img_bytes = image_source
 
+        if img is None and img_bytes:
+            img = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
         if img is None:
             return None, "Could not decode image"
 
-        # Download the DNN face detection model if not cached
+        # ---- Try DNN face detection ----
         try:
-            import urllib.request
             model_dir = Path.home() / '.cache' / 'portraitpay'
             model_dir.mkdir(parents=True, exist_ok=True)
             prototxt = model_dir / 'deploy.prototxt'
             caffemodel = model_dir / 'res10_300x300_ssd_iter_140000.caffemodel'
 
-            if not caffemodel.exists():
-                logger.info("Downloading OpenCV DNN face detection model...")
-                url1 = 'https://raw.githubusercontent.com/opencv/opencv/master/samples/dnn/face_detector/deploy.prototxt'
-                urllib.request.urlretrieve(url1, str(prototxt))
-                url2 = 'https://raw.githubusercontent.com/opencv/opencv_3rdparty/dnn_samples_face_detector_20170830/res10_300x300_ssd_iter_140000.caffemodel'
-                urllib.request.urlretrieve(url2, str(caffemodel))
-                logger.info("Model downloaded.")
+            if caffemodel.exists() and prototxt.exists():
+                net = cv2.dnn.readNetFromCaffe(str(prototxt), str(caffemodel))
+                h, w = img.shape[:2]
+                blob = cv2.dnn.blobFromImage(cv2.resize(img, (300, 300)), 1.0, (300, 300), (104.0, 177.0, 123.0))
+                net.setInput(blob)
+                detections = net.forward()
+                best_conf, best_box = 0, None
+                for i in range(detections.shape[2]):
+                    conf = detections[0, 0, i, 2]
+                    if conf > 0.5 and conf > best_conf:
+                        box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
+                        best_conf, best_box = conf, box.astype(int)
+                if best_box is not None:
+                    x1, y1, x2, y2 = best_box
+                    face = img[y1:y2, x1:x2]
+                    emb = extract_from_face(face)
+                    if emb:
+                        return emb, None
+        except Exception:
+            pass  # DNN failed, fall through to simple crop
 
-            net = cv2.dnn.readNetFromCaffe(str(prototxt), str(caffemodel))
-            h, w = img.shape[:2]
-            blob = cv2.dnn.blobFromImage(cv2.resize(img, (300, 300)), 1.0, (300, 300), (104.0, 177.0, 123.0))
-            net.setInput(blob)
-            detections = net.forward()
-
-            # Find largest face with confidence > 0.5
-            best_conf, best_box = 0, None
-            for i in range(detections.shape[2]):
-                conf = detections[0, 0, i, 2]
-                if conf > 0.5 and conf > best_conf:
-                    box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
-                    best_conf, best_box = conf, box.astype(int)
-
-            if best_box is None:
-                return None, "no_face_detected"
-
-            x1, y1, x2, y2 = best_box
-            face = img[y1:y2, x1:x2]
-
-            # Feature extraction: color histogram + HOG-like gradient features
-            # 1. Color histogram (HSV)
-            hsv = cv2.cvtColor(face, cv2.COLOR_BGR2HSV)
-            hist_h = cv2.calcHist([hsv], [0], None, [32], [0, 180]).flatten()
-            hist_s = cv2.calcHist([hsv], [1], None, [32], [0, 256]).flatten()
-            hist_v = cv2.calcHist([hsv], [2], None, [32], [0, 256]).flatten()
-
-            # 2. LBP-like gradient map (simplified)
-            gray = cv2.cvtColor(face, cv2.COLOR_BGR2GRAY)
-            resized = cv2.resize(gray, (64, 64))
-            # Sobel gradients
-            sobelx = cv2.Sobel(resized, cv2.CV_64F, 1, 0, ksize=3)
-            sobely = cv2.Sobel(resized, cv2.CV_64F, 0, 1, ksize=3)
-            magnitude = np.sqrt(sobelx**2 + sobely**2)
-            angle = np.arctan2(sobely, sobelx)
-
-            # Create gradient histogram (HOG-like, 8x8 cells, 9 bins)
-            cell_h, cell_w = 8, 8
-            n_bins = 9
-            cells_h = 8  # 64/8
-            cells_w = 8
-            hog_features = []
-            for cy in range(cells_h):
-                for cx in range(cells_w):
-                    cell_mag = magnitude[cy*cell_h:(cy+1)*cell_h, cx*cell_w:(cx+1)*cell_w]
-                    cell_ang = angle[cy*cell_h:(cy+1)*cell_h, cx*cell_w:(cx+1)*cell_w]
-                    hist, _ = np.histogram(cell_ang.ravel(), bins=n_bins, range=(-np.pi, np.pi), weights=cell_mag.ravel())
-                    hog_features.extend(hist)
-            hog_features = np.array(hog_features, dtype=np.float32)
-
-            # 3. Resized grayscale pixels (downsampled for dimensionality reduction)
-            small_gray = cv2.resize(gray, (32, 32)).flatten().astype(np.float32)
-
-            # Normalize and combine
-            def norm(x):
-                n = np.linalg.norm(x)
-                return x / n if n > 0 else x
-
-            color_feat = np.concatenate([hist_h, hist_s, hist_v]).astype(np.float32)
-            color_feat = norm(color_feat)
-            hog_feat = norm(hog_features)
-            pixel_feat = norm(small_gray)
-
-            # Weighted combination: 20% color + 40% HOG + 40% pixel
-            embedding = np.concatenate([color_feat * 0.2, hog_feat * 0.4, pixel_feat * 0.4])
-            embedding = norm(embedding)
-
-            # Convert to list for JSON serialization
-            return embedding.tolist(), None
-
-        except Exception as e:
-            return None, f"embedding_error: {str(e)}"
+        # ---- Fallback: center crop + resize ----
+        h, w = img.shape[:2]
+        crop_size = min(h, w)
+        y_offset = (h - crop_size) // 2
+        x_offset = (w - crop_size) // 2
+        face = img[y_offset:y_offset+crop_size, x_offset:x_offset+crop_size]
+        emb = extract_from_face(face)
+        if emb:
+            return emb, None
+        return None, "embedding extraction failed"
 
     except Exception as e:
         return None, f"embedding_error: {str(e)}"
