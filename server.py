@@ -222,15 +222,14 @@ def pay_uploader(uid, amt):
 
 def _extract_face_embedding(image_source):
     """
-    Extract face embedding using OpenCV DNN + ResNet.
-    Falls back to pixel-based if DNN model unavailable.
+    Extract face embedding using OpenCV DNN face detection + histogram+HOG features.
+    Lightweight, no heavy ML dependencies needed.
     Returns (embedding_list, error_msg).
     """
     import cv2
     import numpy as np
 
     img = None
-    img_bytes = None
     try:
         if isinstance(image_source, str):
             if image_source.startswith('data:'):
@@ -250,10 +249,8 @@ def _extract_face_embedding(image_source):
         if img is None:
             return None, "Could not decode image"
 
-        # Use OpenCV DNN face detector (ResNet-SSD based)
-        # Try to download/find the face detection model
+        # Download the DNN face detection model if not cached
         try:
-            # Download the DNN face detection model if not cached
             import urllib.request
             model_dir = Path.home() / '.cache' / 'portraitpay'
             model_dir.mkdir(parents=True, exist_ok=True)
@@ -261,11 +258,12 @@ def _extract_face_embedding(image_source):
             caffemodel = model_dir / 'res10_300x300_ssd_iter_140000.caffemodel'
 
             if not caffemodel.exists():
-                # Download ResNet-SSD face detector (5MB)
-                url = 'https://raw.githubusercontent.com/opencv/opencv/master/samples/dnn/face_detector/deploy.prototxt'
-                urllib.request.urlretrieve(url, str(prototxt))
-                url = 'https://raw.githubusercontent.com/opencv/opencv_3rdparty/dnn_samples_face_detector_20170830/res10_300x300_ssd_iter_140000.caffemodel'
-                urllib.request.urlretrieve(url, str(caffemodel))
+                logger.info("Downloading OpenCV DNN face detection model...")
+                url1 = 'https://raw.githubusercontent.com/opencv/opencv/master/samples/dnn/face_detector/deploy.prototxt'
+                urllib.request.urlretrieve(url1, str(prototxt))
+                url2 = 'https://raw.githubusercontent.com/opencv/opencv_3rdparty/dnn_samples_face_detector_20170830/res10_300x300_ssd_iter_140000.caffemodel'
+                urllib.request.urlretrieve(url2, str(caffemodel))
+                logger.info("Model downloaded.")
 
             net = cv2.dnn.readNetFromCaffe(str(prototxt), str(caffemodel))
             h, w = img.shape[:2]
@@ -273,7 +271,7 @@ def _extract_face_embedding(image_source):
             net.setInput(blob)
             detections = net.forward()
 
-            # Find largest face
+            # Find largest face with confidence > 0.5
             best_conf, best_box = 0, None
             for i in range(detections.shape[2]):
                 conf = detections[0, 0, i, 2]
@@ -287,41 +285,58 @@ def _extract_face_embedding(image_source):
             x1, y1, x2, y2 = best_box
             face = img[y1:y2, x1:x2]
 
-            # Use ResNet-18 from torchvision as embedding extractor (if available)
-            try:
-                import torch
-                import torchvision.models as models
-                import torchvision.transforms as transforms
+            # Feature extraction: color histogram + HOG-like gradient features
+            # 1. Color histogram (HSV)
+            hsv = cv2.cvtColor(face, cv2.COLOR_BGR2HSV)
+            hist_h = cv2.calcHist([hsv], [0], None, [32], [0, 180]).flatten()
+            hist_s = cv2.calcHist([hsv], [1], None, [32], [0, 256]).flatten()
+            hist_v = cv2.calcHist([hsv], [2], None, [32], [0, 256]).flatten()
 
-                model = models.resnet18(weights='DEFAULT')
-                model = torch.nn.Sequential(*list(model.children())[:-1])  # Remove final FC layer
-                model.eval()
+            # 2. LBP-like gradient map (simplified)
+            gray = cv2.cvtColor(face, cv2.COLOR_BGR2GRAY)
+            resized = cv2.resize(gray, (64, 64))
+            # Sobel gradients
+            sobelx = cv2.Sobel(resized, cv2.CV_64F, 1, 0, ksize=3)
+            sobely = cv2.Sobel(resized, cv2.CV_64F, 0, 1, ksize=3)
+            magnitude = np.sqrt(sobelx**2 + sobely**2)
+            angle = np.arctan2(sobely, sobelx)
 
-                face_rgb = cv2.cvtColor(face, cv2.COLOR_BGR2RGB)
-                face_pil = Image.fromarray(face_rgb)
-                transform = transforms.Compose([
-                    transforms.Resize((224, 224)),
-                    transforms.ToTensor(),
-                    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-                ])
-                tensor = transform(face_pil).unsqueeze(0)
-                with torch.no_grad():
-                    embedding = model(tensor).squeeze().numpy().tolist()
-                return embedding, None
+            # Create gradient histogram (HOG-like, 8x8 cells, 9 bins)
+            cell_h, cell_w = 8, 8
+            n_bins = 9
+            cells_h = 8  # 64/8
+            cells_w = 8
+            hog_features = []
+            for cy in range(cells_h):
+                for cx in range(cells_w):
+                    cell_mag = magnitude[cy*cell_h:(cy+1)*cell_h, cx*cell_w:(cx+1)*cell_w]
+                    cell_ang = angle[cy*cell_h:(cy+1)*cell_h, cx*cell_w:(cx+1)*cell_w]
+                    hist, _ = np.histogram(cell_ang.ravel(), bins=n_bins, range=(-np.pi, np.pi), weights=cell_mag.ravel())
+                    hog_features.extend(hist)
+            hog_features = np.array(hog_features, dtype=np.float32)
 
-            except (ImportError, Exception) as e:
-                # Fallback: pixel-based embedding (resize + flatten + normalize)
-                face_resized = cv2.resize(face, (64, 64))
-                embedding = face_resized.flatten().astype(np.float32)
-                norm = np.linalg.norm(embedding)
-                if norm > 0:
-                    embedding = (embedding / norm * 100).tolist()  # Scale for better similarity
-                else:
-                    return None, "face_too_small"
-                return embedding, None
+            # 3. Resized grayscale pixels (downsampled for dimensionality reduction)
+            small_gray = cv2.resize(gray, (32, 32)).flatten().astype(np.float32)
+
+            # Normalize and combine
+            def norm(x):
+                n = np.linalg.norm(x)
+                return x / n if n > 0 else x
+
+            color_feat = np.concatenate([hist_h, hist_s, hist_v]).astype(np.float32)
+            color_feat = norm(color_feat)
+            hog_feat = norm(hog_features)
+            pixel_feat = norm(small_gray)
+
+            # Weighted combination: 20% color + 40% HOG + 40% pixel
+            embedding = np.concatenate([color_feat * 0.2, hog_feat * 0.4, pixel_feat * 0.4])
+            embedding = norm(embedding)
+
+            # Convert to list for JSON serialization
+            return embedding.tolist(), None
 
         except Exception as e:
-            return None, f"dnn_model_error: {str(e)}"
+            return None, f"embedding_error: {str(e)}"
 
     except Exception as e:
         return None, f"embedding_error: {str(e)}"
