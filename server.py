@@ -4,6 +4,7 @@
 import os, json, sqlite3, hashlib, time, secrets, logging, smtplib, random, string, base64, io
 from datetime import datetime
 from pathlib import Path
+from db import get_db_conn, last_insert_id, dict_from_row, init_database, _use_postgres
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from flask import Flask, request, jsonify
@@ -26,6 +27,7 @@ PLATFORM_FEE = 0.01
 DATA_DIR.mkdir(exist_ok=True)
 UPLOAD_DIR.mkdir(exist_ok=True)
 
+# DB initialization is called after def init_db() below
 app = Flask(__name__)
 CORS(app)
 
@@ -87,120 +89,20 @@ def server_error(e):
     return jsonify({"error": "服务器内部错误", "code": 500}), 500
 
 def init_db():
-    conn = sqlite3.connect(str(DB_PATH))
-    c = conn.cursor()
-    # Add new columns if they don't exist (for existing DBs)
-    for col, col_type in [('email', 'TEXT'), ('verification_code', 'TEXT'), ('verified', 'INTEGER DEFAULT 0')]:
-        try:
-            c.execute(f"ALTER TABLE users ADD COLUMN {col} {col_type}")
-        except:
-            pass  # Column already exists
+    """Initialize database - delegates to db.py which handles both SQLite and PostgreSQL."""
+    init_database()
+    return
 
-    c.execute('''CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE NOT NULL,
-        password_hash TEXT NOT NULL,
-        api_key TEXT UNIQUE,
-        balance REAL DEFAULT 0.0,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        is_admin INTEGER DEFAULT 0,
-        email TEXT,
-        verification_code TEXT,
-        verified INTEGER DEFAULT 0
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS faces (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL,
-        description TEXT,
-        image_path TEXT,
-        hash_id TEXT UNIQUE,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        is_celebrity INTEGER DEFAULT 0,
-        copyright_info TEXT,
-        usage_count INTEGER DEFAULT 0,
-        revenue REAL DEFAULT 0.0,
-        uploader_id INTEGER,
-        original_price REAL DEFAULT 0.0,
-        ai_declaration INTEGER DEFAULT 0,
-        status TEXT DEFAULT 'active'
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS works (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        title TEXT NOT NULL,
-        description TEXT,
-        content TEXT,
-        work_type TEXT,
-        hash_id TEXT UNIQUE,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        author_name TEXT,
-        usage_count INTEGER DEFAULT 0,
-        revenue REAL DEFAULT 0.0,
-        uploader_id INTEGER,
-        original_price REAL DEFAULT 0.0,
-        ai_declaration INTEGER DEFAULT 0,
-        status TEXT DEFAULT 'active'
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS usage_logs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        target_type TEXT,
-        target_id INTEGER,
-        action TEXT,
-        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        user_id INTEGER,
-        amount_paid REAL DEFAULT 0.0
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS revenues (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        source_type TEXT,
-        source_id INTEGER,
-        amount REAL,
-        platform_fee REAL,
-        uploader_id INTEGER,
-        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )''')
-    # Face embeddings for real face recognition
-    c.execute('''CREATE TABLE IF NOT EXISTS face_embeddings (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        face_id INTEGER NOT NULL,
-        embedding BLOB NOT NULL,
-        model_name TEXT DEFAULT 'VGG-Face',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (face_id) REFERENCES faces(id)
-    )''')
-    # Ensure image_path column exists
-    try:
-        c.execute("ALTER TABLE faces ADD COLUMN image_path TEXT")
-    except:
-        pass
-    try:
-        c.execute("ALTER TABLE faces ADD COLUMN id_image_path TEXT")
-    except:
-        pass
-    try:
-        c.execute("ALTER TABLE faces ADD COLUMN age INTEGER DEFAULT 0")
-    except:
-        pass
-    c.execute("SELECT COUNT(*) FROM users WHERE is_admin=1")
-    if c.fetchone()[0] == 0:
-        h = hashlib.sha256("admin123".encode()).hexdigest()
-        c.execute("INSERT INTO users (username, password_hash, is_admin, balance, api_key) VALUES (?, ?, 1, 1000.0, ?)",
-                 ("admin", h, secrets.token_hex(16)))
-    conn.commit()
-    conn.close()
-
-init_db()
 
 def get_user(api_key):
     if not api_key: return None
-    conn = sqlite3.connect(str(DB_PATH)); conn.row_factory = sqlite3.Row
-    c = conn.cursor()
+    conn, c, is_postgres = get_db_conn()
     c.execute("SELECT * FROM users WHERE api_key=?", (api_key,))
     u = c.fetchone(); conn.close()
     return dict(u) if u else None
 
 def charge(uid, amt):
-    conn = sqlite3.connect(str(DB_PATH))
-    c = conn.cursor()
+    conn, c, is_postgres = get_db_conn()
     c.execute("SELECT balance FROM users WHERE id=?", (uid,))
     r = c.fetchone()
     if not r or r[0] < amt: conn.close(); return False
@@ -211,8 +113,7 @@ def charge(uid, amt):
 def pay_uploader(uid, amt):
     fee = amt * PLATFORM_FEE
     net = amt - fee
-    conn = sqlite3.connect(str(DB_PATH))
-    c = conn.cursor()
+    conn, c, is_postgres = get_db_conn()
     c.execute("UPDATE users SET balance = balance + ? WHERE id=?", (net, uid))
     c.execute("INSERT INTO revenues (source_type, amount, platform_fee, uploader_id) VALUES (?, ?, ?, ?)",
              ("query", amt, fee, uid))
@@ -343,9 +244,7 @@ def _find_matching_faces(embedding, threshold=0.35, top_k=5):
     Find matching faces from the database.
     Returns list of dicts with face_id, name, similarity score.
     """
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
+    conn, c, is_postgres = get_db_conn()
     c.execute("""
         SELECT fe.id, fe.face_id, fe.embedding, f.name, f.is_celebrity,
                f.original_price, f.copyright_info, f.image_path
@@ -397,8 +296,7 @@ def register():
     ak = secrets.token_hex(16)
     code = generate_code(6)
     
-    conn = sqlite3.connect(str(DB_PATH))
-    c = conn.cursor()
+    conn, c, is_postgres = get_db_conn()
     try:
         # Check if user already exists
         c.execute("SELECT id FROM users WHERE username=?", (d['username'],))
@@ -408,7 +306,7 @@ def register():
         
         c.execute("INSERT INTO users (username, password_hash, api_key, email, verification_code, verified) VALUES (?, ?, ?, ?, ?, 0)",
                  (d['username'], ph, ak, email, code))
-        conn.commit(); uid = c.lastrowid; conn.close()
+        conn.commit(); uid = last_insert_id(c, is_postgres); conn.close()
         
         # Send verification email
         subject = "PortraitPay 注册验证码"
@@ -432,8 +330,7 @@ def verify_registration():
     if not username or not code:
         return jsonify({"error": "请提供用户名和验证码"}), 400
     
-    conn = sqlite3.connect(str(DB_PATH)); conn.row_factory = sqlite3.Row
-    c = conn.cursor()
+    conn, c, is_postgres = get_db_conn()
     c.execute("SELECT id, verification_code, verified FROM users WHERE username=?", (username,))
     user = c.fetchone()
     
@@ -458,8 +355,7 @@ def verify_registration():
 def login():
     d = request.json
     ph = hashlib.sha256(d.get('password','').encode()).hexdigest()
-    conn = sqlite3.connect(str(DB_PATH)); conn.row_factory = sqlite3.Row
-    c = conn.cursor()
+    conn, c, is_postgres = get_db_conn()
     c.execute("SELECT * FROM users WHERE username=? AND password_hash=?", (d.get('username'), ph))
     u = c.fetchone(); conn.close()
     if u: return jsonify({"success": True, "api_key": u["api_key"], "balance": u["balance"]})
@@ -477,8 +373,7 @@ def deposit():
     if not u: return jsonify({"error": "未授权"}), 401
     amt = request.json.get('amount', 0)
     if amt <= 0: return jsonify({"error": "金额需大于0"}), 400
-    conn = sqlite3.connect(str(DB_PATH))
-    c = conn.cursor()
+    conn, c, is_postgres = get_db_conn()
     c.execute("UPDATE users SET balance = balance + ? WHERE id=?", (amt, u["id"]))
     conn.commit(); conn.close()
     return jsonify({"success": True, "new_balance": u["balance"] + amt})
@@ -489,8 +384,7 @@ def get_faces():
     limit = request.args.get('limit', 50, type=int)
     offset = request.args.get('offset', 0, type=int)
 
-    conn = sqlite3.connect(str(DB_PATH)); conn.row_factory = sqlite3.Row
-    c = conn.cursor()
+    conn, c, is_postgres = get_db_conn()
 
     if category == 'celebrity':
         c.execute("SELECT id, name, description, is_celebrity, original_price, ai_declaration, usage_count FROM faces WHERE status='active' AND is_celebrity=1 LIMIT ? OFFSET ?", (limit, offset))
@@ -523,8 +417,7 @@ def search_faces():
     if not q:
         return jsonify({"error": "请提供搜索关键词"}), 400
 
-    conn = sqlite3.connect(str(DB_PATH)); conn.row_factory = sqlite3.Row
-    c = conn.cursor()
+    conn, c, is_postgres = get_db_conn()
     pattern = f"%{q}%"
     c.execute("SELECT id, name, description, is_celebrity, original_price, ai_declaration, usage_count FROM faces WHERE status='active' AND name LIKE ? LIMIT ? OFFSET ?", (pattern, limit, offset))
     rows = c.fetchall()
@@ -541,8 +434,7 @@ def add_face():
     if not d.get('ai_declaration'):
         return jsonify({"error": "必须声明非AI生成"}), 400
     hid = hashlib.sha256(f"{d.get('name')}{time.time()}".encode()).hexdigest()[:16]
-    conn = sqlite3.connect(str(DB_PATH))
-    c = conn.cursor()
+    conn, c, is_postgres = get_db_conn()
     c.execute("INSERT INTO faces (name, description, hash_id, is_celebrity, copyright_info, uploader_id, original_price, ai_declaration) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
              (d.get('name'), d.get('description'), hid, d.get('is_celebrity',0), d.get('copyright_info'), u['id'], d.get('price',0), d.get('ai_declaration')))
     conn.commit(); conn.close()
@@ -551,8 +443,7 @@ def add_face():
 @app.route('/api/faces/<int:fid>', methods=['GET'])
 def get_face(fid):
     u = get_user(request.headers.get('X-API-Key'))
-    conn = sqlite3.connect(str(DB_PATH)); conn.row_factory = sqlite3.Row
-    c = conn.cursor()
+    conn, c, is_postgres = get_db_conn()
     c.execute("SELECT * FROM faces WHERE id=? AND status='active'", (fid,))
     f = c.fetchone()
     if not f: conn.close(); return jsonify({"error": "不存在"}), 404
@@ -568,8 +459,7 @@ def get_face(fid):
 
 @app.route('/api/works', methods=['GET'])
 def get_works():
-    conn = sqlite3.connect(str(DB_PATH)); conn.row_factory = sqlite3.Row
-    c = conn.cursor()
+    conn, c, is_postgres = get_db_conn()
     c.execute("SELECT id, title, description, work_type, author_name, original_price, ai_declaration FROM works WHERE status='active'")
     rows = c.fetchall(); conn.close()
     return jsonify([dict(r) for r in rows])
@@ -582,8 +472,7 @@ def add_work():
     if not d.get('ai_declaration'):
         return jsonify({"error": "必须声明非AI生成"}), 400
     hid = hashlib.sha256(f"{d.get('title')}{time.time()}".encode()).hexdigest()[:16]
-    conn = sqlite3.connect(str(DB_PATH))
-    c = conn.cursor()
+    conn, c, is_postgres = get_db_conn()
     c.execute("INSERT INTO works (title, description, content, work_type, hash_id, author_name, uploader_id, original_price, ai_declaration) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
              (d.get('title'), d.get('description'), d.get('content'), d.get('work_type'), hid, d.get('author_name'), u['id'], d.get('price',0), d.get('ai_declaration')))
     conn.commit(); conn.close()
@@ -592,8 +481,7 @@ def add_work():
 @app.route('/api/works/<int:wid>', methods=['GET'])
 def get_work(wid):
     u = get_user(request.headers.get('X-API-Key'))
-    conn = sqlite3.connect(str(DB_PATH)); conn.row_factory = sqlite3.Row
-    c = conn.cursor()
+    conn, c, is_postgres = get_db_conn()
     c.execute("SELECT * FROM works WHERE id=? AND status='active'", (wid,))
     w = c.fetchone()
     if not w: conn.close(); return jsonify({"error": "不存在"}), 404
@@ -609,7 +497,7 @@ def get_work(wid):
 
 @app.route('/api/stats', methods=['GET'])
 def stats():
-    conn = sqlite3.connect(str(DB_PATH)); c = conn.cursor()
+    conn, c, is_postgres = get_db_conn()
     c.execute("SELECT COUNT(*) FROM faces WHERE status='active'")
     fc = c.fetchone()[0]
     c.execute("SELECT COUNT(*) FROM works WHERE status='active'")
@@ -627,8 +515,7 @@ def stats():
 def my_uploads():
     u = get_user(request.headers.get('X-API-Key'))
     if not u: return jsonify({"error": "未授权"}), 401
-    conn = sqlite3.connect(str(DB_PATH)); conn.row_factory = sqlite3.Row
-    c = conn.cursor()
+    conn, c, is_postgres = get_db_conn()
     c.execute("SELECT * FROM faces WHERE uploader_id=?", (u['id'],))
     fs = [dict(r) for r in c.fetchall()]
     c.execute("SELECT * FROM works WHERE uploader_id=?", (u['id'],))
@@ -651,8 +538,7 @@ def get_history():
     limit = request.args.get('limit', 50, type=int)
     offset = request.args.get('offset', 0, type=int)
     
-    conn = sqlite3.connect(str(DB_PATH)); conn.row_factory = sqlite3.Row
-    c = conn.cursor()
+    conn, c, is_postgres = get_db_conn()
     
     if chart_mode:
         # 返回最近7天每日收益（图表用）
@@ -704,8 +590,7 @@ def export_data():
     u = get_user(request.headers.get('X-API-Key'))
     if not u: return jsonify({"error": "未授权"}), 401
     
-    conn = sqlite3.connect(str(DB_PATH)); conn.row_factory = sqlite3.Row
-    c = conn.cursor()
+    conn, c, is_postgres = get_db_conn()
     
     c.execute("SELECT * FROM faces WHERE uploader_id=?", (u['id'],))
     faces = [dict(r) for r in c.fetchall()]
@@ -755,9 +640,7 @@ def llm_verify():
     if not face_id:
         return jsonify({"error": "缺少face_id"}), 400
     
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
+    conn, c, is_postgres = get_db_conn()
     c.execute("SELECT * FROM faces WHERE id=? AND status='active'", (face_id,))
     face = c.fetchone()
     conn.close()
@@ -782,8 +665,7 @@ def llm_verify():
 @app.route('/api/debug/face/<int:fid>', methods=['GET'])
 def debug_face(fid):
     """Debug endpoint to check face uploader_id."""
-    conn = sqlite3.connect(str(DB_PATH)); conn.row_factory = sqlite3.Row
-    c = conn.cursor()
+    conn, c, is_postgres = get_db_conn()
     c.execute("SELECT * FROM faces WHERE id=?", (fid,))
     face = c.fetchone()
     conn.close()
@@ -813,9 +695,7 @@ def register_face_embedding():
             return jsonify({"error": "缺少图片"}), 400
 
         # Verify the face exists
-        conn = sqlite3.connect(str(DB_PATH))
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
+        conn, c, is_postgres = get_db_conn()
         c.execute("SELECT * FROM faces WHERE id=? AND status='active'", (face_id,))
         face = c.fetchone()
         conn.close()
@@ -835,8 +715,7 @@ def register_face_embedding():
 
         # Store embedding
         import pickle
-        conn = sqlite3.connect(str(DB_PATH))
-        c = conn.cursor()
+        conn, c, is_postgres = get_db_conn()
         c.execute("DELETE FROM face_embeddings WHERE face_id=?", (face_id,))
         c.execute("INSERT INTO face_embeddings (face_id, embedding, model_name) VALUES (?, ?, ?)",
                    (face_id, pickle.dumps(embedding), 'hist-hog-pixel'))
@@ -869,9 +748,7 @@ def list_face_embeddings():
     """
     List all faces that have embeddings registered.
     """
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
+    conn, c, is_postgres = get_db_conn()
     c.execute("""
         SELECT f.id, f.name, f.is_celebrity, f.original_price, f.image_path,
                fe.model_name, fe.created_at
@@ -998,8 +875,7 @@ def upload_portrait():
         return jsonify({"error": "请先登录"}), 401
     
     # 检查是否已上传过
-    conn = sqlite3.connect(str(DB_PATH))
-    c = conn.cursor()
+    conn, c, is_postgres = get_db_conn()
     c.execute("SELECT id FROM faces WHERE uploader_id=?", (user['id'],))
     existing = c.fetchone()
     if existing:
@@ -1057,7 +933,7 @@ def upload_portrait():
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
              (name, portrait_path, hash_id, 0, user['id'], 0, ai_declaration, age, id_path))
     conn.commit()
-    face_id = c.lastrowid
+    face_id = last_insert_id(c, is_postgres)
     conn.close()
     
     return jsonify({
