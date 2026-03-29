@@ -102,6 +102,10 @@ _PG_SCHEMA = {
         type VARCHAR(20) NOT NULL, amount FLOAT NOT NULL,
         status VARCHAR(20) DEFAULT 'pending', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         face_id INTEGER, work_id INTEGER, description TEXT""",
+    "revenues": """id SERIAL PRIMARY KEY, source_type VARCHAR(20) NOT NULL,
+        amount FLOAT NOT NULL, platform_fee FLOAT NOT NULL,
+        uploader_id INTEGER REFERENCES users(id),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP""",
 }
 
 _SQLITE_SCHEMA = {
@@ -141,6 +145,9 @@ _SQLITE_SCHEMA["transactions"] = """id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER, type TEXT NOT NULL, amount REAL NOT NULL,
         status TEXT DEFAULT 'pending', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         face_id INTEGER, work_id INTEGER, description TEXT"""
+_SQLITE_SCHEMA["revenues"] = """id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source_type TEXT NOT NULL, amount REAL NOT NULL, platform_fee REAL NOT NULL,
+        uploader_id INTEGER, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"""
 
 # ── Init ──────────────────────────────────────────────────────────────────────
 def init_database():
