@@ -6,7 +6,6 @@ from datetime import datetime
 from pathlib import Path
 import portrait_db as db_module
 from portrait_db import get_db_conn, last_insert_id, dict_from_row, init_database
-from db import get_db_conn, last_insert_id, dict_from_row, init_database, _use_postgres
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from flask import Flask, request, jsonify
