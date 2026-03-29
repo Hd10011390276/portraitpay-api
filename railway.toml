@@ -5,3 +5,9 @@
   numReplicas = 1
   restartPolicyType = "ON_FAILURE"
   restartPolicyMaxRetries = 10
+
+[disks]
+  data = { size = "1GB", mountPoint = "/data" }
+
+[environment]
+  RAILWAY_PRIVATE_DIR = "/data"
