@@ -749,6 +749,18 @@ def debug_whoami():
         "api_key": api_key
     })
 
+@app.route('/api/debug/test-query', methods=['GET'])
+def debug_test_query():
+    """Test parameterized query on Railway PG."""
+    try:
+        conn, c, is_pg = get_db_conn()
+        c.execute("SELECT COUNT(*) FROM users WHERE username=%s", ("nonexistent",))
+        r = dict(c.fetchone())
+        conn.close()
+        return jsonify({"works": True, "result": r})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route('/api/debug/dbinfo', methods=['GET'])
 def debug_dbinfo():
     """Check database connection and environment on Railway."""
