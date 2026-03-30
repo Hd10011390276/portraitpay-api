@@ -306,7 +306,7 @@ def register():
             conn.close()
             return jsonify({"error": "用户名已存在"}), 400
         
-        c.execute("INSERT INTO users (username, password_hash, api_key, email, verification_code, verified) VALUES (%s, %s, %s, %s, %s, 0)",
+        c.execute("INSERT INTO users (username, password_hash, api_key, email, verification_code, verified) VALUES (%s, %s, %s, %s, %s, FALSE)",
                  (d['username'], ph, ak, email, code))
         conn.commit(); uid = last_insert_id(c, is_pg); conn.close()
         
