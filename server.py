@@ -99,16 +99,16 @@ def init_db():
 def get_user(api_key):
     if not api_key: return None
     conn, c, is_pg = get_db_conn()
-    c.execute("SELECT * FROM users WHERE api_key=?", (api_key,))
+    c.execute("SELECT * FROM users WHERE api_key=%s", (api_key,))
     u = c.fetchone(); conn.close()
     return dict(u) if u else None
 
 def charge(uid, amt):
     conn, c, is_pg = get_db_conn()
-    c.execute("SELECT balance FROM users WHERE id=?", (uid,))
+    c.execute("SELECT balance FROM users WHERE id=%s", (uid,))
     r = c.fetchone()
     if not r or dict(r)['balance'] < amt: conn.close(); return False
-    c.execute("UPDATE users SET balance = balance - ? WHERE id=?", (amt, uid))
+    c.execute("UPDATE users SET balance = balance - %s WHERE id=%s", (amt, uid))
     conn.commit(); conn.close()
     return True
 
@@ -116,8 +116,8 @@ def pay_uploader(uid, amt):
     fee = amt * PLATFORM_FEE
     net = amt - fee
     conn, c, is_pg = get_db_conn()
-    c.execute("UPDATE users SET balance = balance + ? WHERE id=?", (net, uid))
-    c.execute("INSERT INTO revenues (source_type, amount, platform_fee, uploader_id) VALUES (?, ?, ?, ?)",
+    c.execute("UPDATE users SET balance = balance + %s WHERE id=%s", (net, uid))
+    c.execute("INSERT INTO revenues (source_type, amount, platform_fee, uploader_id) VALUES (%s, %s, %s, %s)",
              ("query", amt, fee, uid))
     conn.commit(); conn.close()
 
@@ -301,12 +301,12 @@ def register():
     conn, c, is_pg = get_db_conn()
     try:
         # Check if user already exists
-        c.execute("SELECT id FROM users WHERE username=?", (d['username'],))
+        c.execute("SELECT id FROM users WHERE username=%s", (d['username'],))
         if c.fetchone():
             conn.close()
             return jsonify({"error": "用户名已存在"}), 400
         
-        c.execute("INSERT INTO users (username, password_hash, api_key, email, verification_code, verified) VALUES (?, ?, ?, ?, ?, 0)",
+        c.execute("INSERT INTO users (username, password_hash, api_key, email, verification_code, verified) VALUES (%s, %s, %s, %s, %s, 0)",
                  (d['username'], ph, ak, email, code))
         conn.commit(); uid = last_insert_id(c, is_pg); conn.close()
         
@@ -334,7 +334,7 @@ def verify_registration():
         return jsonify({"error": "请提供用户名和验证码"}), 400
     
     conn, c, is_pg = get_db_conn()
-    c.execute("SELECT id, verification_code, verified FROM users WHERE username=?", (username,))
+    c.execute("SELECT id, verification_code, verified FROM users WHERE username=%s", (username,))
     user = c.fetchone()
     
     if not user:
@@ -349,7 +349,7 @@ def verify_registration():
         conn.close()
         return jsonify({"error": "验证码错误"}), 400
     
-    c.execute("UPDATE users SET verified=1, verification_code=NULL WHERE id=?", (user['id'],))
+    c.execute("UPDATE users SET verified=1, verification_code=NULL WHERE id=%s", (user['id'],))
     conn.commit(); conn.close()
     
     return jsonify({"success": True, "message": "验证成功，欢迎加入PortraitPay！"})
@@ -359,7 +359,7 @@ def login():
     d = request.json
     ph = hashlib.sha256(d.get('password','').encode()).hexdigest()
     conn, c, is_pg = get_db_conn()
-    c.execute("SELECT * FROM users WHERE username=? AND password_hash=?", (d.get('username'), ph))
+    c.execute("SELECT * FROM users WHERE username=%s AND password_hash=%s", (d.get('username'), ph))
     u = c.fetchone(); conn.close()
     if u: return jsonify({"success": True, "api_key": u["api_key"], "balance": u["balance"]})
     return jsonify({"error": "登录失败"}), 401
@@ -377,7 +377,7 @@ def deposit():
     amt = request.json.get('amount', 0)
     if amt <= 0: return jsonify({"error": "金额需大于0"}), 400
     conn, c, is_pg = get_db_conn()
-    c.execute("UPDATE users SET balance = balance + ? WHERE id=?", (amt, u["id"]))
+    c.execute("UPDATE users SET balance = balance + %s WHERE id=%s", (amt, u["id"]))
     conn.commit(); conn.close()
     return jsonify({"success": True, "new_balance": u["balance"] + amt})
 
@@ -390,11 +390,11 @@ def get_faces():
     conn, c, is_pg = get_db_conn()
 
     if category == 'celebrity':
-        c.execute("SELECT id, name, description, is_celebrity, original_price, ai_declaration, usage_count FROM faces WHERE status='active' AND is_celebrity=1 LIMIT ? OFFSET ?", (limit, offset))
+        c.execute("SELECT id, name, description, is_celebrity, original_price, ai_declaration, usage_count FROM faces WHERE status='active' AND is_celebrity=1 LIMIT %s OFFSET %s", (limit, offset))
     elif category == 'normal':
-        c.execute("SELECT id, name, description, is_celebrity, original_price, ai_declaration, usage_count FROM faces WHERE status='active' AND is_celebrity=0 LIMIT ? OFFSET ?", (limit, offset))
+        c.execute("SELECT id, name, description, is_celebrity, original_price, ai_declaration, usage_count FROM faces WHERE status='active' AND is_celebrity=0 LIMIT %s OFFSET %s", (limit, offset))
     else:
-        c.execute("SELECT id, name, description, is_celebrity, original_price, ai_declaration, usage_count FROM faces WHERE status='active' LIMIT ? OFFSET ?", (limit, offset))
+        c.execute("SELECT id, name, description, is_celebrity, original_price, ai_declaration, usage_count FROM faces WHERE status='active' LIMIT %s OFFSET %s", (limit, offset))
 
     rows = c.fetchall()
 
@@ -422,9 +422,9 @@ def search_faces():
 
     conn, c, is_pg = get_db_conn()
     pattern = f"%{q}%"
-    c.execute("SELECT id, name, description, is_celebrity, original_price, ai_declaration, usage_count FROM faces WHERE status='active' AND name LIKE ? LIMIT ? OFFSET ?", (pattern, limit, offset))
+    c.execute("SELECT id, name, description, is_celebrity, original_price, ai_declaration, usage_count FROM faces WHERE status='active' AND name LIKE %s LIMIT %s OFFSET %s", (pattern, limit, offset))
     rows = c.fetchall()
-    c.execute("SELECT COUNT(*) FROM faces WHERE status='active' AND name LIKE ?", (pattern,))
+    c.execute("SELECT COUNT(*) FROM faces WHERE status='active' AND name LIKE %s", (pattern,))
     total = dict(c.fetchone())['count']
     conn.close()
     return jsonify({"faces": [dict(r) for r in rows], "total": total, "limit": limit, "offset": offset, "query": q})
@@ -438,7 +438,7 @@ def add_face():
         return jsonify({"error": "必须声明非AI生成"}), 400
     hid = hashlib.sha256(f"{d.get('name')}{time.time()}".encode()).hexdigest()[:16]
     conn, c, is_pg = get_db_conn()
-    c.execute("INSERT INTO faces (name, description, hash_id, is_celebrity, copyright_info, uploader_id, original_price, ai_declaration) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    c.execute("INSERT INTO faces (name, description, hash_id, is_celebrity, copyright_info, uploader_id, original_price, ai_declaration) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
              (d.get('name'), d.get('description'), hid, d.get('is_celebrity',0), d.get('copyright_info'), u['id'], d.get('price',0), d.get('ai_declaration')))
     conn.commit(); conn.close()
     return jsonify({"success": True, "hash_id": hid})
@@ -447,12 +447,12 @@ def add_face():
 def get_face(fid):
     u = get_user(request.headers.get('X-API-Key'))
     conn, c, is_pg = get_db_conn()
-    c.execute("SELECT * FROM faces WHERE id=? AND status='active'", (fid,))
+    c.execute("SELECT * FROM faces WHERE id=%s AND status='active'", (fid,))
     f = c.fetchone()
     if not f: conn.close(); return jsonify({"error": "不存在"}), 404
     price = f["original_price"] or 0
     if price == 0 or (u and charge(u['id'], price)):
-        c.execute("UPDATE faces SET usage_count = usage_count + 1 WHERE id=?", (fid,))
+        c.execute("UPDATE faces SET usage_count = usage_count + 1 WHERE id=%s", (fid,))
         if price > 0 and f["uploader_id"]: pay_uploader(f["uploader_id"], price)
         conn.commit()
         conn.close()
@@ -476,7 +476,7 @@ def add_work():
         return jsonify({"error": "必须声明非AI生成"}), 400
     hid = hashlib.sha256(f"{d.get('title')}{time.time()}".encode()).hexdigest()[:16]
     conn, c, is_pg = get_db_conn()
-    c.execute("INSERT INTO works (title, description, content, work_type, hash_id, author_name, uploader_id, original_price, ai_declaration) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    c.execute("INSERT INTO works (title, description, content, work_type, hash_id, author_name, uploader_id, original_price, ai_declaration) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
              (d.get('title'), d.get('description'), d.get('content'), d.get('work_type'), hid, d.get('author_name'), u['id'], d.get('price',0), d.get('ai_declaration')))
     conn.commit(); conn.close()
     return jsonify({"success": True, "hash_id": hid})
@@ -485,12 +485,12 @@ def add_work():
 def get_work(wid):
     u = get_user(request.headers.get('X-API-Key'))
     conn, c, is_pg = get_db_conn()
-    c.execute("SELECT * FROM works WHERE id=? AND status='active'", (wid,))
+    c.execute("SELECT * FROM works WHERE id=%s AND status='active'", (wid,))
     w = c.fetchone()
     if not w: conn.close(); return jsonify({"error": "不存在"}), 404
     price = w["original_price"] or 0
     if price == 0 or (u and charge(u['id'], price)):
-        c.execute("UPDATE works SET usage_count = usage_count + 1 WHERE id=?", (wid,))
+        c.execute("UPDATE works SET usage_count = usage_count + 1 WHERE id=%s", (wid,))
         if price > 0 and w["uploader_id"]: pay_uploader(w["uploader_id"], price)
         conn.commit()
         conn.close()
@@ -522,14 +522,14 @@ def my_uploads():
     u = get_user(request.headers.get('X-API-Key'))
     if not u: return jsonify({"error": "未授权"}), 401
     conn, c, is_pg = get_db_conn()
-    c.execute("SELECT * FROM faces WHERE uploader_id=?", (u['id'],))
+    c.execute("SELECT * FROM faces WHERE uploader_id=%s", (u['id'],))
     fs = [dict(r) for r in c.fetchall()]
-    c.execute("SELECT * FROM works WHERE uploader_id=?", (u['id'],))
+    c.execute("SELECT * FROM works WHERE uploader_id=%s", (u['id'],))
     ws = [dict(r) for r in c.fetchall()]
-    c.execute("SELECT SUM(amount-platform_fee) FROM revenues WHERE uploader_id=?", (u['id'],))
+    c.execute("SELECT SUM(amount-platform_fee) FROM revenues WHERE uploader_id=%s", (u['id'],))
     earn = dict(c.fetchone()).get('sum') or 0
     # 获取余额
-    c.execute("SELECT balance FROM users WHERE id=?", (u['id'],))
+    c.execute("SELECT balance FROM users WHERE id=%s", (u['id'],))
     balance = dict(c.fetchone())['balance']
     conn.close()
     return jsonify({"faces": fs, "works": ws, "earnings": earn, "balance": balance})
@@ -551,7 +551,7 @@ def get_history():
         c.execute("""
             SELECT DATE(created_at) as date, SUM(amount - platform_fee) as amount
             FROM revenues
-            WHERE uploader_id = ? AND created_at >= DATE('now', '-7 days')
+            WHERE uploader_id = %s AND created_at >= DATE('now', '-7 days')
             GROUP BY DATE(created_at)
             ORDER BY date ASC
         """, (u['id'],))
@@ -565,9 +565,9 @@ def get_history():
                'AI调用' as usage_type, '已结算' as status
         FROM usage_logs ul
         JOIN faces f ON ul.target_id = f.id
-        WHERE ul.user_id = ?
+        WHERE ul.user_id = %s
         ORDER BY ul.timestamp DESC
-        LIMIT ? OFFSET ?
+        LIMIT %s OFFSET %s
     """, (u['id'], limit, offset))
     face_history = [dict(r) for r in c.fetchall()]
     
@@ -577,9 +577,9 @@ def get_history():
                '作品查看' as usage_type, '已结算' as status
         FROM usage_logs ul
         JOIN works w ON ul.target_id = w.id
-        WHERE ul.user_id = ?
+        WHERE ul.user_id = %s
         ORDER BY ul.timestamp DESC
-        LIMIT ? OFFSET ?
+        LIMIT %s OFFSET %s
     """, (u['id'], limit, offset))
     work_history = [dict(r) for r in c.fetchall()]
     
@@ -598,13 +598,13 @@ def export_data():
     
     conn, c, is_pg = get_db_conn()
     
-    c.execute("SELECT * FROM faces WHERE uploader_id=?", (u['id'],))
+    c.execute("SELECT * FROM faces WHERE uploader_id=%s", (u['id'],))
     faces = [dict(r) for r in c.fetchall()]
     
-    c.execute("SELECT * FROM works WHERE uploader_id=?", (u['id'],))
+    c.execute("SELECT * FROM works WHERE uploader_id=%s", (u['id'],))
     works = [dict(r) for r in c.fetchall()]
     
-    c.execute("SELECT * FROM revenues WHERE uploader_id=?", (u['id'],))
+    c.execute("SELECT * FROM revenues WHERE uploader_id=%s", (u['id'],))
     revenues = [dict(r) for r in c.fetchall()]
     
     conn.close()
@@ -647,7 +647,7 @@ def llm_verify():
         return jsonify({"error": "缺少face_id"}), 400
     
     conn, c, is_pg = get_db_conn()
-    c.execute("SELECT * FROM faces WHERE id=? AND status='active'", (face_id,))
+    c.execute("SELECT * FROM faces WHERE id=%s AND status='active'", (face_id,))
     face = c.fetchone()
     conn.close()
     
@@ -672,7 +672,7 @@ def llm_verify():
 def debug_face(fid):
     """Debug endpoint to check face uploader_id."""
     conn, c, is_pg = get_db_conn()
-    c.execute("SELECT * FROM faces WHERE id=?", (fid,))
+    c.execute("SELECT * FROM faces WHERE id=%s", (fid,))
     face = c.fetchone()
     conn.close()
     if not face:
@@ -702,7 +702,7 @@ def register_face_embedding():
 
         # Verify the face exists
         conn, c, is_pg = get_db_conn()
-        c.execute("SELECT * FROM faces WHERE id=? AND status='active'", (face_id,))
+        c.execute("SELECT * FROM faces WHERE id=%s AND status='active'", (face_id,))
         face = c.fetchone()
         conn.close()
 
@@ -722,8 +722,8 @@ def register_face_embedding():
         # Store embedding
         import pickle
         conn, c, is_pg = get_db_conn()
-        c.execute("DELETE FROM face_embeddings WHERE face_id=?", (face_id,))
-        c.execute("INSERT INTO face_embeddings (face_id, embedding, model_name) VALUES (?, ?, ?)",
+        c.execute("DELETE FROM face_embeddings WHERE face_id=%s", (face_id,))
+        c.execute("INSERT INTO face_embeddings (face_id, embedding, model_name) VALUES (%s, %s, %s)",
                    (face_id, pickle.dumps(embedding), 'hist-hog-pixel'))
         conn.commit()
         conn.close()
@@ -921,7 +921,7 @@ def upload_portrait():
     
     # 检查是否已上传过
     conn, c, is_pg = get_db_conn()
-    c.execute("SELECT id FROM faces WHERE uploader_id=?", (user['id'],))
+    c.execute("SELECT id FROM faces WHERE uploader_id=%s", (user['id'],))
     existing = c.fetchone()
     if existing:
         conn.close()
@@ -975,7 +975,7 @@ def upload_portrait():
     hash_id = hashlib.sha256(f"{name}{user['id']}{time.time()}".encode()).hexdigest()[:16]
     
     c.execute('''INSERT INTO faces (name, image_path, hash_id, is_celebrity, uploader_id, original_price, ai_declaration, age, id_image_path)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)''',
              (name, portrait_path, hash_id, 0, user['id'], 0, ai_declaration, age, id_path))
     conn.commit()
     face_id = last_insert_id(c, is_pg)
