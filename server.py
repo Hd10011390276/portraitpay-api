@@ -499,19 +499,23 @@ def get_work(wid):
 
 @app.route('/api/stats', methods=['GET'])
 def stats():
-    conn, c, is_pg = get_db_conn()
-    c.execute("SELECT COUNT(*) FROM faces WHERE status='active'")
-    fc = c.fetchone()[0]
-    c.execute("SELECT COUNT(*) FROM works WHERE status='active'")
-    wc = c.fetchone()[0]
-    c.execute("SELECT SUM(usage_count) FROM faces")
-    fu = c.fetchone()[0] or 0
-    c.execute("SELECT SUM(usage_count) FROM works")
-    wu = c.fetchone()[0] or 0
-    c.execute("SELECT SUM(platform_fee) FROM revenues")
-    pr = c.fetchone()[0] or 0
-    conn.close()
-    return jsonify({"faces": fc, "works": wc, "uses": fu+wu, "platform_revenue": pr, "fee_rate": "1%"})
+    try:
+        conn, c, is_pg = get_db_conn()
+        c.execute("SELECT COUNT(*) FROM faces WHERE status='active'")
+        fc = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM works WHERE status='active'")
+        wc = c.fetchone()[0]
+        c.execute("SELECT SUM(usage_count) FROM faces")
+        fu = c.fetchone()[0] or 0
+        c.execute("SELECT SUM(usage_count) FROM works")
+        wu = c.fetchone()[0] or 0
+        c.execute("SELECT SUM(platform_fee) FROM revenues")
+        pr = c.fetchone()[0] or 0
+        conn.close()
+        return jsonify({"faces": fc, "works": wc, "uses": fu+wu, "platform_revenue": pr, "fee_rate": "1%"})
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
 
 @app.route('/api/my', methods=['GET'])
 def my_uploads():
