@@ -745,6 +745,33 @@ def debug_whoami():
         "api_key": api_key
     })
 
+@app.route('/api/debug/dbinfo', methods=['GET'])
+def debug_dbinfo():
+    """Check database connection and environment on Railway."""
+    import platform
+    env_keys = ['DATABASE_URL', 'RAILWAY_ENVIRONMENT', 'POSTGRES_HOST', 'POSTGRES_PORT',
+                'POSTGRES_USER', 'POSTGRES_PASSWORD', 'POSTGRES_DB', 'PGHOST', 'PGPORT',
+                'PGUSER', 'PGPASSWORD', 'PGDATABASE', 'PGURL', 'POSTGRES_URL']
+    env_info = {k: os.environ.get(k, '(not set)')[:50] for k in env_keys}
+    env_info['_USE_PG'] = str(db_module._USE_PG)
+    env_info['_PG_URL'] = (db_module._PG_URL or '(none)')[:50]
+    env_info['platform'] = platform.system()
+    env_info['cwd'] = str(Path(__file__).parent)
+    
+    # Try to list tables
+    table_info = {}
+    try:
+        conn, c, is_pg = get_db_conn()
+        c.execute("SELECT tablename FROM pg_tables WHERE schemaname='public'" if is_pg 
+                  else "SELECT name FROM sqlite_master WHERE type='table'")
+        tables = c.fetchall()
+        table_info['tables'] = [dict_from_row(t) for t in tables]
+        conn.close()
+    except Exception as e:
+        table_info['error'] = str(e)
+    
+    return jsonify({**env_info, **table_info})
+
 @app.route('/api/faces/list-embeddings', methods=['GET'])
 def list_face_embeddings():
     """
