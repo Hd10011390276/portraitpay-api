@@ -507,8 +507,7 @@ def stats():
         wc = dict(c.fetchone())['count']
         c.execute("SELECT SUM(usage_count) FROM faces")
         fu = dict(c.fetchone()).get('sum') or 0
-        c.execute("SELECT SUM(usage_count) FROM works")
-        wu = dict(c.fetchone()).get('sum') or 0
+        wu = 0  # works table has no usage_count column
         c.execute("SELECT SUM(platform_fee) FROM revenues")
         pr = dict(c.fetchone()).get('sum') or 0
         conn.close()

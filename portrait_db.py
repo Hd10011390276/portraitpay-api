@@ -56,9 +56,9 @@ def get_db_conn():
 def last_insert_id(_conn, _cursor, _is_pg):
     if _is_pg:
         _cursor.execute("SELECT lastval()")
-        return _cursor.fetchone()[0]
+        return dict(_cursor.fetchone())['lastval']
     _cursor.execute("SELECT last_insert_rowid()")
-    return _cursor.fetchone()[0]
+    return dict(_cursor.fetchone())[0]
 
 def dict_from_row(row):
     """Alias for row_to_dict for backward compatibility."""
@@ -157,6 +157,32 @@ def init_database():
         cur = conn.cursor()
         for _tbl, _cols in _PG_SCHEMA.items():
             cur.execute(f"CREATE TABLE IF NOT EXISTS {_tbl} ({_cols})")
+        # Migration: add missing columns to existing tables
+        _migrations = [
+            ("works", ["title TEXT", "description TEXT", "content TEXT", "work_type VARCHAR(50)",
+                       "hash_id VARCHAR(64)", "author_name VARCHAR(100)", "original_price FLOAT",
+                       "ai_declaration BOOLEAN DEFAULT FALSE", "usage_count INTEGER DEFAULT 0",
+                       "uploader_id INTEGER"]),
+            ("faces", ["description TEXT"]),
+            ("users", ["email VARCHAR(255)", "verification_code VARCHAR(10)", "verified BOOLEAN DEFAULT FALSE"]),
+        ]
+        for _tbl, _new_cols in _migrations:
+            for _col_def in _new_cols:
+                _col_name = _col_def.split()[0]
+                try:
+                    cur.execute(f"ALTER TABLE {_tbl} ADD COLUMN {_col_def}")
+                except psycopg2.errors.DuplicateColumn:
+                    pass
+        # Rename old works columns to new names if old columns exist and new don't
+        _col_renames = [
+            ("works", "work_name", "title"),
+            ("works", "creator_id", "uploader_id"),
+        ]
+        for (_tbl, _old, _new) in _col_renames:
+            try:
+                cur.execute(f"ALTER TABLE {_tbl} RENAME COLUMN {_old} TO {_new}")
+            except (psycopg2.errors.UndefinedColumn, psycopg2.errors.DuplicateColumn):
+                pass
         conn.commit()
         conn.close()
     else:
