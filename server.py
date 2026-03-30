@@ -321,7 +321,8 @@ def register():
     except Exception as e:
         conn.close()
         logger.error(f"Registration error: {e}")
-        return jsonify({"error": "用户名已存在或注册失败"}), 400
+        import traceback; traceback.print_exc()
+        return jsonify({"error": "用户名已存在或注册失败", "detail": str(e)}), 400
 
 @app.route('/api/register/verify', methods=['POST'])
 def verify_registration():
