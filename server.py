@@ -124,6 +124,84 @@ def pay_uploader(uid, amt):
 
 # ─── Face Recognition Helpers ────────────────────────────────────────────────
 
+# =============================================================================
+# ArcFace (InsightFace buffalo_l) embedding - 512-dim deep learning embeddings
+# =============================================================================
+
+_arcface_app = None
+_arcface_loading_attempted = False
+
+def _get_arcface_app():
+    """Load and cache the InsightFace buffalo_l model."""
+    global _arcface_app, _arcface_loading_attempted
+    if _arcface_app is not None:
+        return _arcface_app
+    if _arcface_loading_attempted:
+        return None
+    _arcface_loading_attempted = True
+    try:
+        from insightface.app import FaceAnalysis
+        app = FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider'])
+        app.prepare(ctx_id=0, det_size=(640, 640))
+        _arcface_app = app
+        logger.info("InsightFace buffalo_l model loaded successfully")
+        return app
+    except ImportError:
+        logger.warning("InsightFace not installed, ArcFace embeddings unavailable")
+        return None
+    except Exception as e:
+        logger.warning(f"InsightFace model loading failed: {e}")
+        return None
+
+
+def _extract_arcface_embedding(image_source):
+    """
+    Extract 512-dim ArcFace embedding using InsightFace buffalo_l.
+    Returns (embedding_list, error_msg).
+    Falls back to None if InsightFace is not available.
+    """
+    import cv2
+    import numpy as np
+
+    app = _get_arcface_app()
+    if app is None:
+        return None, "insightface_unavailable"
+
+    # Decode image
+    img = None
+    img_bytes = None
+    if isinstance(image_source, str):
+        if image_source.startswith('data:'):
+            b64 = image_source.split(',')[1]
+            img_bytes = base64.b64decode(b64)
+        elif len(image_source) > 200 and not Path(image_source).exists():
+            img_bytes = base64.b64decode(image_source)
+        elif Path(image_source).exists():
+            img = cv2.imread(str(image_source))
+        else:
+            img_bytes = base64.b64decode(image_source)
+    elif isinstance(image_source, bytes):
+        img_bytes = image_source
+
+    if img is None and img_bytes:
+        img = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        return None, "could_not_decode_image"
+
+    try:
+        faces = app.get(img)
+        if not faces:
+            return None, "no_face_detected"
+        largest = max(faces, key=lambda f: (f.bbox[2]-f.bbox[0])*(f.bbox[3]-f.bbox[1]))
+        return largest.embedding.tolist(), None
+    except Exception as e:
+        return None, str(e)
+
+
+# =============================================================================
+# OpenCV-based face embedding (fallback when InsightFace unavailable)
+# =============================================================================
+
 def _extract_face_embedding(image_source):
     """
     Extract face embedding using OpenCV (pure Python, no external model files needed).
@@ -308,7 +386,7 @@ def register():
         
         c.execute("INSERT INTO users (username, password_hash, api_key, email, verification_code, verified) VALUES (%s, %s, %s, %s, %s, FALSE)",
                  (d['username'], ph, ak, email, code))
-        conn.commit(); uid = last_insert_id(c, is_pg); conn.close()
+        conn.commit(); uid = last_insert_id(conn, c, is_pg); conn.close()
         
         # Send verification email
         subject = "PortraitPay 注册验证码"
@@ -841,6 +919,89 @@ def match_face():
     })
 
 
+@app.route('/api/faces/match-celeb', methods=['POST'])
+def match_celebrity():
+    """
+    Match a face image against celebrity database using ArcFace (InsightFace buffalo_l).
+    This endpoint uses deep learning embeddings (512-dim) for high-accuracy matching.
+    
+    Body: { image: base64_string, top_k: 5 (optional) }
+    Returns top-k matched celebrities sorted by cosine similarity.
+    """
+    import numpy as np
+    
+    data = request.json
+    image_data = data.get('image')
+    top_k = int(data.get('top_k', 5))
+    
+    if not image_data:
+        return jsonify({"error": "缺少图片"}), 400
+    
+    # Extract ArcFace embedding
+    embedding, err = _extract_arcface_embedding(image_data)
+    if err:
+        logger.error(f"ArcFace embedding extraction failed: {err}")
+        return jsonify({
+            "error": f"人脸识别失败: {err}",
+            "model": "arcface_buffalo_l",
+            "available": _arcface_app is not None
+        }), 422
+    
+    # Find matches only among celebrity embeddings (ArcFace embeddings)
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("""
+        SELECT fe.id, fe.face_id, fe.embedding, f.name, ci.category,
+               f.original_price, f.copyright_info, f.image_path, fe.model_name
+        FROM face_embeddings fe
+        JOIN faces f ON fe.face_id = f.id
+        JOIN celebrity_info ci ON f.id = ci.face_id
+        WHERE f.status = 'active' AND f.is_celebrity = 1
+    """)
+    rows = c.fetchall()
+    conn.close()
+    
+    def norm(x):
+        n = np.linalg.norm(x)
+        return (x / n) if n > 0 else x
+    
+    def cosine_sim(a, b):
+        return float(np.dot(norm(a), norm(b)))
+    
+    matches = []
+    for row in rows:
+        try:
+            stored_emb = json.loads(row['embedding'])
+        except (json.JSONDecodeError, TypeError):
+            continue
+        
+        sim = cosine_sim(embedding, stored_emb)
+        matches.append({
+            'face_id': row['face_id'],
+            'name': row['name'],
+            'category': row['category'],
+            'is_celebrity': True,
+            'similarity': round(sim, 4),
+            'similarity_pct': round(sim * 100, 1),
+            'price': row['original_price'] or 0,
+            'copyright_info': row['copyright_info'],
+            'image_path': row['image_path'],
+            'model': row['model_name']
+        })
+    
+    matches.sort(key=lambda x: x['similarity'], reverse=True)
+    top_matches = matches[:top_k]
+    
+    return jsonify({
+        "matches": top_matches,
+        "total_db_celebs": len(rows),
+        "top_k": top_k,
+        "embedding_dim": len(embedding),
+        "model": "arcface_buffalo_l"
+    })
+
+
 @app.route('/api/llm/portrait-check', methods=['POST'])
 def llm_portrait_check():
     """
@@ -978,7 +1139,7 @@ def upload_portrait():
                  VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)''',
              (name, portrait_path, hash_id, 0, user['id'], 0, ai_declaration, age, id_path))
     conn.commit()
-    face_id = last_insert_id(c, is_pg)
+    face_id = last_insert_id(conn, c, is_pg)
     conn.close()
     
     return jsonify({
