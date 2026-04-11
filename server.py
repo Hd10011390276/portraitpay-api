@@ -1155,3 +1155,444 @@ def open_upload_folder():
     """返回上传文件夹路径"""
     return jsonify({"folder": str(UPLOAD_DIR)})
 
+
+# =============================================================================
+# Local-First Portrait Fingerprint API (Phase 2)
+# These endpoints support Local-First architecture where:
+# - Original portraits stay on user's device
+# - Only irreversible fingerprint hashes are stored on server
+# - Server cannot access original images
+# =============================================================================
+
+@app.route('/api/portrait/register-fingerprint', methods=['POST'])
+def register_portrait_fingerprint():
+    """
+    Register a portrait fingerprint (Local-First).
+    Browser generates fingerprint locally, sends hash to server.
+    Original image never leaves user's device.
+
+    Request body:
+    {
+        "name": "User Name",
+        "fingerprint_hash": "hex_string_64_chars",
+        "fingerprint_type": "phash|dhash|ahash",
+        "local_device_id": "optional_device_identifier",
+        "price": 0,
+        "ai_declaration": true,
+        "copyright_info": "optional_copyright_text"
+    }
+    """
+    api_key = request.headers.get('X-API-Key')
+    user = get_user(api_key)
+    if not user:
+        return jsonify({"error": "请先登录"}), 401
+
+    data = request.json
+    name = data.get('name', '').strip()
+    fingerprint_hash = data.get('fingerprint_hash', '').strip()
+    fingerprint_type = data.get('fingerprint_type', 'phash')
+    local_device_id = data.get('local_device_id', '')
+    price = data.get('price', 0)
+    ai_declaration = data.get('ai_declaration', 0)
+    copyright_info = data.get('copyright_info', '')
+
+    # Validation
+    if not name:
+        return jsonify({"error": "请提供姓名/艺名"}), 400
+    if not fingerprint_hash or len(fingerprint_hash) < 16:
+        return jsonify({"error": "指纹哈希无效"}), 400
+    if len(fingerprint_hash) > 128:
+        return jsonify({"error": "指纹哈希过长"}), 400
+    if not ai_declaration:
+        return jsonify({"error": "必须声明非AI生成肖像"}), 400
+
+    conn, c, is_pg = get_db_conn()
+
+    # Check if user already has a face registered
+    c.execute("SELECT id FROM faces WHERE uploader_id=%s", (user['id'],))
+    existing = c.fetchone()
+    if existing:
+        conn.close()
+        return jsonify({"error": "每位用户只能注册一张肖像"}), 400
+
+    # Generate hash_id for this face
+    import time
+    hash_id = hashlib.sha256(f"{name}{user['id']}{time.time()}".encode()).hexdigest()[:16]
+
+    # Insert face record (without storing any image paths)
+    c.execute('''INSERT INTO faces (name, hash_id, is_celebrity, uploader_id, original_price, ai_declaration, copyright_info, age, fingerprint_registered, local_device_id)
+                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
+             (name, hash_id, 0, user['id'], price, ai_declaration, copyright_info, 18, 1, local_device_id))
+    conn.commit()
+    face_id = last_insert_id(conn, c, is_pg)
+
+    # Insert fingerprint record
+    c.execute('''INSERT INTO portrait_fingerprints (face_id, fingerprint_hash, fingerprint_type, model_name)
+                 VALUES (%s, %s, %s, %s)''',
+             (face_id, fingerprint_hash, fingerprint_type, 'browser_local'))
+    conn.commit()
+    conn.close()
+
+    logger.info(f"Portrait fingerprint registered for user {user['id']}, face_id={face_id}")
+    return jsonify({
+        "success": True,
+        "face_id": face_id,
+        "hash_id": hash_id,
+        "message": "肖像指纹注册成功！其他用户现在可以查询您的授权状态"
+    })
+
+
+@app.route('/api/portrait/search-by-fingerprint', methods=['POST'])
+def search_portrait_by_fingerprint():
+    """
+    Search for a portrait by fingerprint (Local-First).
+    Browser generates fingerprint from query image, sends to server.
+    Server compares against stored fingerprints.
+
+    Request body:
+    {
+        "fingerprint_hash": "hex_string_64_chars",
+        "fingerprint_type": "phash|dhash|ahash",
+        "threshold": 0.85,  // optional, similarity threshold
+        "limit": 5  // optional, max results
+    }
+
+    Returns:
+    {
+        "matches": [
+            {
+                "face_id": 123,
+                "name": "XXX",
+                "similarity": 0.92,
+                "authorization_status": "available|unavailable|pending|unknown",
+                "price": 100,
+                "usage_restrictions": ["no_porn", "no_politics"]
+            }
+        ],
+        "total": 1,
+        "search_id": "audit_id"
+    }
+    """
+    data = request.json
+    fingerprint_hash = data.get('fingerprint_hash', '').strip()
+    fingerprint_type = data.get('fingerprint_type', 'phash')
+    threshold = data.get('threshold', 0.35)  # Default threshold for Hamming distance
+    limit = min(data.get('limit', 5), 20)
+
+    if not fingerprint_hash:
+        return jsonify({"error": "请提供指纹哈希"}), 400
+
+    conn, c, is_pg = get_db_conn()
+
+    # Get all registered fingerprints
+    c.execute("""
+        SELECT pf.fingerprint_hash, pf.fingerprint_type, pf.face_id,
+               f.name, f.is_celebrity, f.original_price, f.copyright_info,
+               f.ai_declaration, f.status
+        FROM portrait_fingerprints pf
+        JOIN faces f ON pf.face_id = f.id
+        WHERE pf.fingerprint_type = %s AND f.status = 'active'
+    """, (fingerprint_type,))
+
+    rows = c.fetchall()
+    matches = []
+
+    for row in rows:
+        stored_hash = row['fingerprint_hash']
+        # Calculate Hamming distance for perceptual hashes
+        if fingerprint_type in ('phash', 'dhash', 'ahash'):
+            similarity = _hamming_similarity(fingerprint_hash, stored_hash)
+        else:
+            # Fallback: exact match only
+            similarity = 1.0 if fingerprint_hash == stored_hash else 0.0
+
+        if similarity >= threshold:
+            # Determine authorization status
+            if row['status'] != 'active':
+                auth_status = 'unavailable'
+            elif row['ai_declaration'] == 0:
+                auth_status = 'pending_review'
+            else:
+                auth_status = 'available'
+
+            matches.append({
+                'face_id': row['face_id'],
+                'name': row['name'],
+                'is_celebrity': bool(row['is_celebrity']),
+                'similarity': round(float(similarity), 4),
+                'authorization_status': auth_status,
+                'price': row['original_price'] or 0,
+                'copyright_info': row['copyright_info'],
+            })
+
+    # Sort by similarity descending
+    matches.sort(key=lambda x: x['similarity'], reverse=True)
+    matches = matches[:limit]
+
+    # Log search query for audit (without storing the actual fingerprint)
+    c.execute('''INSERT INTO search_queries (query_fingerprint_hash, results_count, top_match_face_id, top_match_similarity)
+                 VALUES (%s, %s, %s, %s)''',
+             (fingerprint_hash[:16], len(matches),
+              matches[0]['face_id'] if matches else None,
+              matches[0]['similarity'] if matches else None))
+    conn.commit()
+    search_id = last_insert_id(conn, c, is_pg)
+    conn.close()
+
+    return jsonify({
+        "matches": matches,
+        "total": len(matches),
+        "search_id": search_id,
+        "message": "查询成功" if matches else "未找到匹配的肖像"
+    })
+
+
+def _hamming_similarity(hash1: str, hash2: str) -> float:
+    """
+    Calculate similarity between two hex-encoded perceptual hashes.
+    Returns a value between 0 (completely different) and 1 (identical).
+    Uses Hamming distance - count of differing bits.
+    """
+    if len(hash1) != len(hash2):
+        # Try matching shorter strings
+        min_len = min(len(hash1), len(hash2))
+        hash1 = hash1[:min_len]
+        hash2 = hash2[:min_len]
+
+    # Convert hex strings to binary and count differences
+    try:
+        b1 = int(hash1, 16)
+        b2 = int(hash2, 16)
+    except ValueError:
+        return 0.0
+
+    # Calculate Hamming distance
+    xor = b1 ^ b2
+    hamming_distance = bin(xor).count('1')
+
+    # Convert to similarity (assuming 64-character hex = 256 bits)
+    bit_length = max(len(hash1) * 4, 1)  # 4 bits per hex char
+    similarity = 1.0 - (hamming_distance / bit_length)
+
+    return max(0.0, min(1.0, similarity))
+
+
+@app.route('/api/portrait/authorization-check', methods=['POST'])
+def check_portrait_authorization():
+    """
+    Check if a specific portrait can be used for a given purpose.
+    This is the core licensing query API.
+
+    Request body:
+    {
+        "face_id": 123,
+        "usage_type": "ai_training|ai_generation|advertising|entertainment",
+        "commercial_use": true|false,
+        "exclusive": false
+    }
+
+    Returns:
+    {
+        "can_use": true|false,
+        "authorization_status": "available|unavailable|pending|requires_manual_approval",
+        "price": 100,
+        "license_type": "standard|commercial|exclusive",
+        "restrictions": ["no_porn", "no_politics"],
+        "requires_contract": true|false
+    }
+    """
+    data = request.json
+    face_id = data.get('face_id')
+    usage_type = data.get('usage_type', 'ai_generation')
+    commercial_use = data.get('commercial_use', False)
+    exclusive = data.get('exclusive', False)
+
+    if not face_id:
+        return jsonify({"error": "请提供 face_id"}), 400
+
+    conn, c, is_pg = get_db_conn()
+    c.execute("""
+        SELECT f.*, pf.fingerprint_hash
+        FROM faces f
+        LEFT JOIN portrait_fingerprints pf ON f.id = pf.face_id
+        WHERE f.id = %s
+    """, (face_id,))
+
+    face = c.fetchone()
+    conn.close()
+
+    if not face:
+        return jsonify({"error": "肖像不存在"}), 404
+
+    face_dict = dict(face) if face else {}
+
+    # Determine authorization status
+    if face_dict.get('status') != 'active':
+        return jsonify({
+            "can_use": False,
+            "authorization_status": "unavailable",
+            "reason": "该肖像已被禁用或删除"
+        })
+
+    if face_dict.get('ai_declaration') == 0:
+        return jsonify({
+            "can_use": False,
+            "authorization_status": "pending_review",
+            "reason": "该肖像正在审核中"
+        })
+
+    # Determine price based on usage type
+    base_price = face_dict.get('original_price') or 0
+    if commercial_use:
+        price = base_price * 2  # Commercial use costs more
+    elif exclusive:
+        price = base_price * 5  # Exclusive is most expensive
+    else:
+        price = base_price
+
+    # Determine restrictions from copyright_info
+    restrictions = []
+    copyright_info = face_dict.get('copyright_info', '') or ''
+    restriction_keywords = {
+        'no_porn': ['色情', '成人', 'porn', 'nsfw'],
+        'no_politics': ['政治', 'politics'],
+        'no_ads': ['广告', 'advertising'],
+        'no_medical': ['医疗', 'medical']
+    }
+    for restr, keywords in restriction_keywords.items():
+        if any(kw.lower() in copyright_info.lower() for kw in keywords):
+            restrictions.append(restr)
+
+    # Some usage types always require manual approval
+    requires_manual = usage_type in ('advertising', 'exclusive') or exclusive
+
+    return jsonify({
+        "can_use": True,
+        "authorization_status": "available" if not requires_manual else "requires_manual_approval",
+        "price": price,
+        "license_type": "exclusive" if exclusive else ("commercial" if commercial_use else "standard"),
+        "restrictions": restrictions,
+        "requires_contract": requires_manual,
+        "usage_type": usage_type,
+        "message": "可以授权使用" if not requires_manual else "需要人工审批"
+    })
+
+
+@app.route('/api/portrait/update-authorization', methods=['PUT'])
+def update_portrait_authorization():
+    """
+    Update portrait authorization settings.
+    User can update price, copyright_info, usage restrictions.
+
+    Request body:
+    {
+        "face_id": 123,
+        "price": 100,
+        "copyright_info": "仅限AI训练使用，禁止商用",
+        "status": "active|inactive"
+    }
+    """
+    api_key = request.headers.get('X-API-Key')
+    user = get_user(api_key)
+    if not user:
+        return jsonify({"error": "请先登录"}), 401
+
+    data = request.json
+    face_id = data.get('face_id')
+    price = data.get('price')
+    copyright_info = data.get('copyright_info')
+    status = data.get('status')
+
+    if not face_id:
+        return jsonify({"error": "请提供 face_id"}), 400
+
+    conn, c, is_pg = get_db_conn()
+
+    # Verify ownership
+    c.execute("SELECT uploader_id FROM faces WHERE id=%s", (face_id,))
+    face = c.fetchone()
+    if not face:
+        conn.close()
+        return jsonify({"error": "肖像不存在"}), 404
+    if dict(face)['uploader_id'] != user['id']:
+        conn.close()
+        return jsonify({"error": "无权修改此肖像"}), 403
+
+    # Build update query dynamically
+    updates = []
+    params = []
+    if price is not None:
+        updates.append("original_price = %s")
+        params.append(price)
+    if copyright_info is not None:
+        updates.append("copyright_info = %s")
+        params.append(copyright_info)
+    if status is not None:
+        updates.append("status = %s")
+        params.append(status)
+
+    if updates:
+        params.append(face_id)
+        c.execute(f"UPDATE faces SET {', '.join(updates)} WHERE id = %s", tuple(params))
+        conn.commit()
+
+    conn.close()
+    return jsonify({"success": True, "message": "授权设置已更新"})
+
+
+# =============================================================================
+# Admin & Utility Endpoints
+# =============================================================================
+
+@app.route('/api/admin/stats', methods=['GET'])
+def admin_stats():
+    """Get platform statistics for admin dashboard."""
+    api_key = request.headers.get('X-API-Key')
+    user = get_user(api_key)
+    if not user or not user.get('is_admin'):
+        return jsonify({"error": "需要管理员权限"}), 403
+
+    conn, c, is_pg = get_db_conn()
+
+    c.execute("SELECT COUNT(*) as total FROM faces WHERE status='active'")
+    total_faces = dict(c.fetchone())['count']
+
+    c.execute("SELECT COUNT(*) as total FROM users")
+    total_users = dict(c.fetchone())['count']
+
+    c.execute("SELECT COUNT(*) as total FROM portrait_fingerprints")
+    total_fingerprints = dict(c.fetchone())['count']
+
+    c.execute("SELECT SUM(results_count) as total FROM search_queries")
+    result = c.fetchone()
+    total_searches = dict(result)['total'] or 0 if result else 0
+
+    conn.close()
+
+    return jsonify({
+        "total_faces": total_faces,
+        "total_users": total_users,
+        "total_fingerprints": total_fingerprints,
+        "total_searches": total_searches,
+        "local_first_enabled": True
+    })
+
+
+@app.route('/api/health/local-first', methods=['GET'])
+def health_local_first():
+    """Health check for Local-First API."""
+    conn, c, is_pg = get_db_conn()
+    c.execute("SELECT COUNT(*) as fp_count FROM portrait_fingerprints")
+    result = c.fetchone()
+    fp_count = dict(result)['count'] if result else 0
+    conn.close()
+
+    return jsonify({
+        "status": "healthy",
+        "local_first_mode": True,
+        "fingerprints_registered": fp_count,
+        "server_stores_fingerprints_only": True,
+        "original_images_never_stored": True
+    })
+
+
