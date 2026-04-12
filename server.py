@@ -2114,8 +2114,19 @@ def admin_init_db():
         conn.commit()
         conn.close()
 
-        # 6. Optionally create admin user
+        # 6. Ensure users table has is_admin column ( Railway PG schema migration)
         data = request.json or {}
+        if is_pg:
+            c.execute("SELECT column_name FROM information_schema.columns WHERE table_name='users' AND column_name='is_admin'")
+            if not c.fetchone():
+                c.execute("ALTER TABLE users ADD COLUMN is_admin BOOLEAN DEFAULT FALSE")
+                conn.commit()
+                results.append("Added is_admin column to users table")
+            else:
+                results.append("is_admin column already exists in users table")
+        conn.close()
+
+        # 7. Optionally create admin user
         admin_api_key = None
         if data.get('create_admin'):
             admin_username = data.get('admin_username', 'admin')
