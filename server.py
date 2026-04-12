@@ -1290,6 +1290,12 @@ def register_faceapi_embedding():
 
     conn, c, is_pg = get_db_conn()
 
+    # Debug: check faces columns
+    if is_pg:
+        c.execute("SELECT column_name FROM information_schema.columns WHERE table_name='faces' AND table_schema='public'")
+        cols = [dict_from_row(r)['column_name'] for r in c.fetchall()]
+        logger.info(f"Faces table columns: {cols}")
+
     # Check if user already has a face
     c.execute("SELECT id FROM faces WHERE uploader_id=%s", (user['id'],))
     if c.fetchone():
