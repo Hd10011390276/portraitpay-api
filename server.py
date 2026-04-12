@@ -1280,44 +1280,52 @@ def register_faceapi_embedding():
 
     conn, c, is_pg = get_db_conn()
     user_id = user['id']
+    hash_id = hashlib.sha256(f"{name}{user_id}{time.time()}".encode()).hexdigest()[:16]
 
-    # Check existing faces columns (for debugging)
+    # Get column names and types for the faces table (PostgreSQL)
+    col_info = {}  # col_name -> data_type
     if is_pg:
-        c.execute("SELECT column_name FROM information_schema.columns WHERE table_name='faces' AND table_schema='public'")
-        cols = [dict_from_row(r)['column_name'] for r in c.fetchall()]
-        has_uploader_id = 'uploader_id' in cols
-        has_embedding = 'embedding' in cols
-        logger.info(f"Faces columns: {cols}, has_uploader={has_uploader_id}, has_embedding={has_embedding}")
+        c.execute("SELECT column_name, data_type FROM information_schema.columns WHERE table_name='faces' AND table_schema='public'")
+        for row in c.fetchall():
+            r = dict_from_row(row)
+            col_info[r['column_name']] = r['data_type']
+        has_uploader_id = 'uploader_id' in col_info
+        has_embedding = 'embedding' in col_info
+    else:
+        has_uploader_id = True
+        has_embedding = False
 
-        if has_uploader_id:
-            c.execute("SELECT id FROM faces WHERE uploader_id=%s", (user_id,))
-        else:
-            c.execute("SELECT id FROM faces WHERE hash_id=%s", (f"user_{user_id}",))
-        if c.fetchone():
-            conn.close()
-            return jsonify({"error": "每位用户只能注册一张肖像"}), 400
+    # Check if user already has a face
+    if has_uploader_id:
+        c.execute("SELECT id FROM faces WHERE uploader_id=%s", (user_id,))
+    else:
+        c.execute("SELECT id FROM faces WHERE hash_id=%s", (f"user_{user_id}",))
+    if c.fetchone():
+        conn.close()
+        return jsonify({"error": "每位用户只能注册一张肖像"}), 400
 
-        hash_id = hashlib.sha256(f"{name}{user_id}{time.time()}".encode()).hexdigest()[:16]
+    # Determine boolean values based on actual column types
+    def bool_val(col_name, true_val, false_val):
+        if is_pg and col_name in col_info:
+            return true_val if 'boolean' in col_info[col_name].lower() else (true_val if true_val in (1,0) else false_val)
+        return true_val if true_val in (1,0) else false_val
 
-        if has_embedding:
-            # Railway schema: store embedding directly in faces.embedding
-            c.execute('''INSERT INTO faces (name, hash_id, embedding, model, status, is_celebrity, original_price, ai_declaration, copyright_info, fingerprint_registered, local_device_id)
-                         VALUES (%s, %s, %s, %s, %s, FALSE, %s, %s, %s, TRUE, %s)''',
-                     (name, hash_id, embedding_b64, 'faceapi_128dim', 'active', price, ai_declaration, copyright_info, device_id))
-        else:
-            # Fallback: insert without embedding column
-            c.execute('''INSERT INTO faces (name, hash_id, status, is_celebrity, original_price, ai_declaration, copyright_info, fingerprint_registered, local_device_id)
-                         VALUES (%s, %s, %s, FALSE, %s, %s, %s, TRUE, %s)''',
-                     (name, hash_id, 'active', price, ai_declaration, copyright_info, device_id))
+    # Build dynamic INSERT based on available columns
+    if is_pg and has_embedding:
+        # Railway schema: use faces.embedding column directly
+        ai_val = 'TRUE' if ai_declaration else 'FALSE'
+        c.execute(f"""INSERT INTO faces (name, hash_id, embedding, model, status, is_celebrity, original_price, ai_declaration, copyright_info, fingerprint_registered, local_device_id)
+                      VALUES (%s, %s, %s, %s, %s, 0, %s, {ai_val}, %s, TRUE, %s)""",
+                 (name, hash_id, embedding_b64, 'faceapi_128dim', 'active', price, copyright_info, device_id))
+    elif is_pg:
+        ai_val = 'TRUE' if ai_declaration else 'FALSE'
+        c.execute(f"""INSERT INTO faces (name, hash_id, status, is_celebrity, original_price, ai_declaration, copyright_info, fingerprint_registered, local_device_id)
+                      VALUES (%s, %s, %s, 0, %s, {ai_val}, %s, TRUE, %s)""",
+                 (name, hash_id, 'active', price, copyright_info, device_id))
     else:
         # SQLite fallback
-        c.execute("SELECT id FROM faces WHERE uploader_id=%s", (user_id,))
-        if c.fetchone():
-            conn.close()
-            return jsonify({"error": "每位用户只能注册一张肖像"}), 400
-        hash_id = hashlib.sha256(f"{name}{user_id}{time.time()}".encode()).hexdigest()[:16]
-        c.execute('''INSERT INTO faces (name, hash_id, is_celebrity, uploader_id, original_price, ai_declaration, copyright_info, age, fingerprint_registered, local_device_id)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+        c.execute("""INSERT INTO faces (name, hash_id, is_celebrity, uploader_id, original_price, ai_declaration, copyright_info, age, fingerprint_registered, local_device_id)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                  (name, hash_id, 0, user_id, price, ai_declaration, copyright_info, 18, 1, device_id))
 
     conn.commit()
