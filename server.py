@@ -1243,7 +1243,7 @@ def register_portrait_fingerprint():
 
 
 @app.route('/api/portrait/register-face-embedding', methods=['POST'])
-def register_face_embedding():
+def register_faceapi_embedding():
     """
     Register a face embedding (Local-First, real face recognition).
     Browser extracts 128-dim face embedding using face-api.js,
