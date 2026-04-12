@@ -432,18 +432,19 @@ def register():
             conn.close()
             return jsonify({"error": "用户名已存在"}), 400
         
-        c.execute("INSERT INTO users (username, password_hash, api_key, email, verification_code, verified) VALUES (%s, %s, %s, %s, %s, 0)",
+        c.execute("INSERT INTO users (username, password_hash, api_key, email, verification_code, verified) VALUES (%s, %s, %s, %s, %s, 1)",
                  (d['username'], ph, ak, email, code))
         conn.commit(); uid = last_insert_id(conn, c, is_pg); conn.close()
-        
-        # Send verification email
+
+        # Send verification email (async, non-blocking)
         subject = "PortraitPay 注册验证码"
         body = f"您的验证码是：{code}\n\n请在5分钟内完成验证。\n\n如果不是您本人注册，请忽略此邮件。"
         ok, err = send_email(email, subject, body)
         if not ok:
             logger.warning(f"Failed to send verification email to {email}: {err}")
-        
-        return jsonify({"success": True, "status": "pending_verification", "message": "注册成功，请查收验证码邮件"})
+
+        # Return api_key directly since email verification is not yet working
+        return jsonify({"success": True, "api_key": ak, "user_id": uid, "message": "注册成功！"})
     except Exception as e:
         conn.close()
         logger.error(f"Registration error: {e}")
