@@ -1302,13 +1302,13 @@ def register_faceapi_embedding():
         if has_embedding:
             # Railway schema: store embedding directly in faces.embedding
             c.execute('''INSERT INTO faces (name, hash_id, embedding, model, status, is_celebrity, original_price, ai_declaration, copyright_info, fingerprint_registered, local_device_id)
-                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
-                     (name, hash_id, embedding_b64, 'faceapi_128dim', 'active', 0, price, ai_declaration, copyright_info, 1, device_id))
+                         VALUES (%s, %s, %s, %s, %s, FALSE, %s, %s, %s, TRUE, %s)''',
+                     (name, hash_id, embedding_b64, 'faceapi_128dim', 'active', price, ai_declaration, copyright_info, device_id))
         else:
             # Fallback: insert without embedding column
             c.execute('''INSERT INTO faces (name, hash_id, status, is_celebrity, original_price, ai_declaration, copyright_info, fingerprint_registered, local_device_id)
-                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)''',
-                     (name, hash_id, 'active', 0, price, ai_declaration, copyright_info, 1, device_id))
+                         VALUES (%s, %s, %s, FALSE, %s, %s, %s, TRUE, %s)''',
+                     (name, hash_id, 'active', price, ai_declaration, copyright_info, device_id))
     else:
         # SQLite fallback
         c.execute("SELECT id FROM faces WHERE uploader_id=%s", (user_id,))
