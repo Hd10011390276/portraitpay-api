@@ -1881,4 +1881,203 @@ def send_alert():
     })
 
 
+# =============================================================================
+# Database Migration Endpoint (for setting up new tables)
+# =============================================================================
+
+@app.route('/api/admin/init-db', methods=['POST'])
+def admin_init_db():
+    """
+    Initialize/upgrade database schema.
+    Creates portrait_fingerprints, search_queries tables and adds columns to faces.
+    This is a one-time setup endpoint.
+    """
+    api_key = request.headers.get('X-API-Key')
+    user = get_user(api_key)
+    if not user or not user.get('is_admin'):
+        return jsonify({"error": "需要管理员权限"}), 403
+
+    try:
+        conn, c, is_pg = get_db_conn()
+
+        results = []
+
+        # 1. Create portrait_fingerprints table
+        if is_pg:
+            c.execute("SELECT table_name FROM information_schema.tables WHERE table_name='portrait_fingerprints' AND table_schema='public'")
+        else:
+            c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='portrait_fingerprints'")
+
+        if not c.fetchone():
+            if is_pg:
+                c.execute("""
+                    CREATE TABLE portrait_fingerprints (
+                        id SERIAL PRIMARY KEY,
+                        face_id INTEGER NOT NULL,
+                        fingerprint_hash TEXT NOT NULL,
+                        fingerprint_type TEXT DEFAULT 'phash',
+                        model_name VARCHAR(50),
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(face_id, fingerprint_type)
+                    )
+                """)
+            else:
+                c.execute("""
+                    CREATE TABLE portrait_fingerprints (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        face_id INTEGER NOT NULL,
+                        fingerprint_hash TEXT NOT NULL,
+                        fingerprint_type TEXT DEFAULT 'phash',
+                        model_name TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(face_id, fingerprint_type)
+                    )
+                """)
+            results.append("Created portrait_fingerprints table")
+        else:
+            results.append("portrait_fingerprints table already exists")
+
+        # 2. Create search_queries table
+        if is_pg:
+            c.execute("SELECT table_name FROM information_schema.tables WHERE table_name='search_queries' AND table_schema='public'")
+        else:
+            c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='search_queries'")
+
+        if not c.fetchone():
+            if is_pg:
+                c.execute("""
+                    CREATE TABLE search_queries (
+                        id SERIAL PRIMARY KEY,
+                        query_fingerprint_hash TEXT NOT NULL,
+                        results_count INTEGER DEFAULT 0,
+                        top_match_face_id INTEGER,
+                        top_match_similarity REAL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+            else:
+                c.execute("""
+                    CREATE TABLE search_queries (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        query_fingerprint_hash TEXT NOT NULL,
+                        results_count INTEGER DEFAULT 0,
+                        top_match_face_id INTEGER,
+                        top_match_similarity REAL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+            results.append("Created search_queries table")
+        else:
+            results.append("search_queries table already exists")
+
+        # 3. Create tickets table for admin automation
+        if is_pg:
+            c.execute("SELECT table_name FROM information_schema.tables WHERE table_name='tickets' AND table_schema='public'")
+        else:
+            c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='tickets'")
+
+        if not c.fetchone():
+            if is_pg:
+                c.execute("""
+                    CREATE TABLE tickets (
+                        id SERIAL PRIMARY KEY,
+                        subject TEXT NOT NULL,
+                        body TEXT,
+                        email VARCHAR(255),
+                        category VARCHAR(50) DEFAULT 'other',
+                        priority VARCHAR(20) DEFAULT 'medium',
+                        status VARCHAR(20) DEFAULT 'open',
+                        assigned_to VARCHAR(100),
+                        resolution TEXT,
+                        source VARCHAR(50) DEFAULT 'contact_form',
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        resolved_at TIMESTAMP
+                    )
+                """)
+            else:
+                c.execute("""
+                    CREATE TABLE tickets (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        subject TEXT NOT NULL,
+                        body TEXT,
+                        email TEXT,
+                        category TEXT DEFAULT 'other',
+                        priority TEXT DEFAULT 'medium',
+                        status TEXT DEFAULT 'open',
+                        assigned_to TEXT,
+                        resolution TEXT,
+                        source TEXT DEFAULT 'contact_form',
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        resolved_at TIMESTAMP
+                    )
+                """)
+            results.append("Created tickets table")
+        else:
+            results.append("tickets table already exists")
+
+        # 4. Add columns to faces table (ignore errors if already exist)
+        existing_cols = []
+        if is_pg:
+            c.execute("SELECT column_name FROM information_schema.columns WHERE table_name='faces' AND column_name IN ('fingerprint_registered', 'local_device_id')")
+        else:
+            c.execute("PRAGMA table_info(faces)")
+            rows = c.fetchall()
+            existing_cols = [dict(r)['name'] for r in rows]
+
+        if is_pg:
+            for col, col_type, default in [
+                ('fingerprint_registered', 'BOOLEAN', 'FALSE'),
+                ('local_device_id', 'VARCHAR(128)', 'NULL')
+            ]:
+                c.execute(f"SELECT column_name FROM information_schema.columns WHERE table_name='faces' AND column_name='{col}'")
+                if not c.fetchone():
+                    c.execute(f"ALTER TABLE faces ADD COLUMN {col} {col_type} DEFAULT {default}")
+                    results.append(f"Added {col} column to faces")
+                else:
+                    results.append(f"{col} column already exists in faces")
+        else:
+            if 'fingerprint_registered' not in existing_cols:
+                c.execute("ALTER TABLE faces ADD COLUMN fingerprint_registered INTEGER DEFAULT 0")
+                results.append("Added fingerprint_registered column to faces")
+            else:
+                results.append("fingerprint_registered column already exists in faces")
+
+            if 'local_device_id' not in existing_cols:
+                c.execute("ALTER TABLE faces ADD COLUMN local_device_id TEXT")
+                results.append("Added local_device_id column to faces")
+            else:
+                results.append("local_device_id column already exists in faces")
+
+        # 5. Create index on fingerprint_hash
+        if is_pg:
+            c.execute("SELECT indexname FROM pg_indexes WHERE indexname='idx_fingerprint_hash'")
+        else:
+            c.execute("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_fingerprint_hash'")
+
+        if not c.fetchone():
+            c.execute("CREATE INDEX idx_fingerprint_hash ON portrait_fingerprints(fingerprint_hash)")
+            results.append("Created index on fingerprint_hash")
+        else:
+            results.append("idx_fingerprint_hash index already exists")
+
+        conn.commit()
+        conn.close()
+
+        return jsonify({
+            "success": True,
+            "message": "Database migration completed",
+            "results": results,
+            "is_pg": is_pg
+        })
+
+    except Exception as e:
+        import traceback
+        logger.error(f"Database init error: {e}\n{traceback.format_exc()}")
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "trace": traceback.format_exc()
+        }), 500
 
