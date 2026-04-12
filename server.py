@@ -38,34 +38,82 @@ SMTP_PORT = int(os.environ.get('SMTP_PORT', 465))
 SMTP_USER = os.environ.get('SMTP_USER', 'Dean.hang@portraitpayai.com')
 SMTP_PASSWORD = os.environ.get('SMTP_PASSWORD', '')
 SENDER_EMAIL = SMTP_USER
+# HTTP email API (Resend) - preferred for cloud deployments
+RESEND_API_KEY = os.environ.get('RESEND_API_KEY', '')
+RESEND_FROM = os.environ.get('RESEND_FROM', 'PortraitPay AI <noreply@resend.dev>')
 
 def generate_code(length=6):
     return ''.join(random.choices(string.digits, k=length))
 
 def send_email(to_email, subject, body):
-    """Send email via SMTP. Returns (success, error_message)."""
-    if not SMTP_PASSWORD:
-        return False, "SMTP_PASSWORD not configured"
+    """
+    Send email via Resend HTTP API (preferred) or SMTP (fallback).
+    Runs in a background thread to avoid blocking gunicorn workers.
+    Returns (success, error_message) immediately.
+    """
+    import threading
+
+    def _send():
+        try:
+            if RESEND_API_KEY:
+                _send_via_resend(to_email, subject, body)
+            elif SMTP_PASSWORD:
+                _send_via_smtp(to_email, subject, body)
+            else:
+                logger.warning(f"Email not configured: cannot send to {to_email}")
+        except Exception as e:
+            logger.error(f"Email send failed to {to_email}: {e}")
+
+    thread = threading.Thread(target=_send, daemon=True)
+    thread.start()
+    return True, None  # Fire and forget; registration never blocks
+
+def _send_via_resend(to_email, subject, body):
+    """Send email via Resend HTTP API."""
+    import urllib.request, json
+    payload = json.dumps({
+        "from": RESEND_FROM,
+        "to": [to_email],
+        "subject": subject,
+        "text": body
+    }).encode('utf-8')
+    req = urllib.request.Request(
+        "https://api.resend.com/emails",
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {RESEND_API_KEY}",
+            "Content-Type": "application/json"
+        },
+        method="POST"
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        if resp.status not in (200, 201):
+            raise Exception(f"Resend API error: {resp.status}")
+
+def _send_via_smtp(to_email, subject, body):
+    """Send email via SMTP with short timeout."""
+    import socket
+    msg = MIMEMultipart('alternative')
+    msg['Subject'] = subject
+    msg['From'] = SENDER_EMAIL
+    msg['To'] = to_email
+    msg.attach(MIMEText(body, 'plain', 'utf-8'))
+
+    old_timeout = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(5)
     try:
-        msg = MIMEMultipart('alternative')
-        msg['Subject'] = subject
-        msg['From'] = SENDER_EMAIL
-        msg['To'] = to_email
-        msg.attach(MIMEText(body, 'plain', 'utf-8'))
-        
         if SMTP_PORT == 465:
             with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as server:
                 server.login(SMTP_USER, SMTP_PASSWORD)
                 server.sendmail(SENDER_EMAIL, [to_email], msg.as_string())
         else:
-            with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=5) as server:
                 server.ehlo()
                 server.starttls()
                 server.login(SMTP_USER, SMTP_PASSWORD)
                 server.sendmail(SENDER_EMAIL, [to_email], msg.as_string())
-        return True, None
-    except Exception as e:
-        return False, str(e)
+    finally:
+        socket.setdefaulttimeout(old_timeout)
 
 # 全局错误处理
 @app.errorhandler(400)
