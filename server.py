@@ -1369,35 +1369,33 @@ def search_portrait_by_embedding():
     conn, c, is_pg = get_db_conn()
     matches = []
 
-    def cosine_search(rows):
+    def cosine_sim(vec1, vec2):
+        dot = sum(a * b for a, b in zip(vec1, vec2))
+        n1 = math.sqrt(sum(a * a for a in vec1))
+        n2 = math.sqrt(sum(a * a for a in vec2))
+        return dot / (n1 * n2 + 1e-8)
+
+    def cosine_search_rows(rows):
         results = []
         for row in rows:
             try:
                 row_dict = dict_from_row(row)
-                stored_b64 = row_dict['embedding']
+                stored_b64 = row_dict.get('embedding') or row_dict.get('face_encoding')
                 if not stored_b64:
                     continue
                 stored_bytes = base64.b64decode(stored_b64)
                 stored_vec = list(struct.unpack('128f', stored_bytes[:512]))
-                dot = sum(a * b for a, b in zip(query_vec, stored_vec))
-                norm_q = math.sqrt(sum(a * a for a in query_vec))
-                norm_s = math.sqrt(sum(a * a for a in stored_vec))
-                similarity = dot / (norm_q * norm_s + 1e-8)
-                if similarity >= threshold:
+                sim = cosine_sim(query_vec, stored_vec)
+                if sim >= threshold:
                     status = row_dict.get('status', 'active')
-                    ai_decl = row_dict.get('ai_declaration', 1)
-                    if status != 'active':
-                        auth_status = 'unavailable'
-                    elif ai_decl == 0:
-                        auth_status = 'pending_review'
-                    else:
-                        auth_status = 'available'
+                    ai_decl = row_dict.get('ai_declaration') or row_dict.get('ai_verified') or 1
+                    auth_status = 'unavailable' if status != 'active' else ('pending_review' if ai_decl == 0 else 'available')
                     results.append({
                         'face_id': row_dict['id'],
                         'name': row_dict.get('name', ''),
                         'is_celebrity': bool(row_dict.get('is_celebrity', 0)),
-                        'similarity': round(float(similarity), 4),
-                        'similarity_pct': round(float(similarity) * 100, 1),
+                        'similarity': round(float(sim), 4),
+                        'similarity_pct': round(float(sim) * 100, 1),
                         'authorization_status': auth_status,
                         'price': row_dict.get('original_price') or 0,
                         'copyright_info': row_dict.get('copyright_info', ''),
@@ -1408,43 +1406,66 @@ def search_portrait_by_embedding():
                 continue
         return results
 
-    # Try face_embeddings table first
-    try:
-        c.execute("""
-            SELECT fe.face_id as id, fe.embedding, fe.model_name as model,
-                   f.name, f.is_celebrity, f.original_price, f.copyright_info,
-                   f.ai_declaration, f.status
-            FROM face_embeddings fe
-            JOIN faces f ON fe.face_id = f.id
-            WHERE f.status = 'active' AND fe.model_name = 'faceapi_128dim'
-        """)
-        rows = c.fetchall()
-        if rows:
-            matches.extend(cosine_search(rows))
-    except Exception as e:
-        logger.warning(f"face_embeddings search failed: {e}")
+    # Discover column names in face_embeddings and faces tables
+    fe_cols = {}
+    faces_cols = {}
+    if is_pg:
+        c.execute("SELECT column_name, data_type FROM information_schema.columns WHERE table_name='face_embeddings' AND table_schema='public'")
+        for row in c.fetchall():
+            r = dict_from_row(row)
+            fe_cols[r['column_name']] = r['data_type']
+        c.execute("SELECT column_name, data_type FROM information_schema.columns WHERE table_name='faces' AND table_schema='public'")
+        for row in c.fetchall():
+            r = dict_from_row(row)
+            faces_cols[r['column_name']] = r['data_type']
 
-    # Also search faces.embedding column directly (Railway schema)
-    try:
-        if is_pg:
-            c.execute("""
-                SELECT id, name, embedding, model, is_celebrity, original_price,
-                       copyright_info, ai_declaration, status
-                FROM faces
-                WHERE status = 'active' AND embedding IS NOT NULL AND model = 'faceapi_128dim'
-            """)
-        else:
-            c.execute("""
-                SELECT id, name, embedding, model, is_celebrity, original_price,
-                       copyright_info, ai_declaration, status
-                FROM faces
-                WHERE status = 'active' AND embedding IS NOT NULL AND model = 'faceapi_128dim'
-            """)
-        rows = c.fetchall()
-        if rows:
-            matches.extend(cosine_search(rows))
-    except Exception as e:
-        logger.warning(f"faces.embedding search failed: {e}")
+    logger.info(f"face_embeddings cols: {list(fe_cols.keys())}, faces cols: {list(faces_cols.keys())}")
+
+    # Build face_embeddings query dynamically
+    if fe_cols:
+        fe_emb_col = 'embedding' if 'embedding' in fe_cols else ('face_encoding' if 'face_encoding' in fe_cols else None)
+        fe_id_col = 'face_id' if 'face_id' in fe_cols else 'id'
+        fe_model_col = next((k for k in ['model_name', 'model', 'embedding_type'] if k in fe_cols), None)
+
+        if fe_emb_col:
+            select_parts = [f"fe.{fe_emb_col} as embedding", f"f.id", f"f.name", f"f.is_celebrity", f"f.original_price", f"f.copyright_info", f"f.ai_declaration", f"f.status"]
+            if fe_model_col:
+                select_parts.append(f"fe.{fe_model_col} as model")
+            else:
+                select_parts.append("'unknown' as model")
+
+            where_parts = ["f.status = 'active'"]
+            if fe_model_col:
+                where_parts.append(f"fe.{fe_model_col} = 'faceapi_128dim'")
+
+            query = f"""SELECT {', '.join(select_parts)}
+                         FROM face_embeddings fe JOIN faces f ON fe.{fe_id_col} = f.id
+                         WHERE {' AND '.join(where_parts)}"""
+            try:
+                c.execute(query)
+                rows = c.fetchall()
+                if rows:
+                    matches.extend(cosine_search_rows(rows))
+            except Exception as e:
+                logger.warning(f"face_embeddings search failed: {e}")
+                try:
+                    if is_pg: conn.rollback()
+                except: pass
+
+    # Search faces.embedding directly (Railway schema has embedding in faces)
+    if 'embedding' in faces_cols and 'model' in faces_cols:
+        try:
+            c.execute("""SELECT id, name, embedding, model, is_celebrity, original_price,
+                               copyright_info, ai_declaration, status
+                         FROM faces WHERE status='active' AND embedding IS NOT NULL AND model='faceapi_128dim'""")
+            rows = c.fetchall()
+            if rows:
+                matches.extend(cosine_search_rows(rows))
+        except Exception as e:
+            logger.warning(f"faces.embedding search failed: {e}")
+            try:
+                if is_pg: conn.rollback()
+            except: pass
 
     conn.close()
     matches.sort(key=lambda x: x['similarity'], reverse=True)
