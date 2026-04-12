@@ -483,7 +483,7 @@ def get_faces():
         c.execute("SELECT COUNT(*) FROM faces WHERE status='active' AND is_celebrity=0")
     else:
         c.execute("SELECT COUNT(*) FROM faces WHERE status='active'")
-    total = dict(c.fetchone())['count']
+    total = dict_from_row(c.fetchone())['count']
 
     conn.close()
     return jsonify({"faces": [dict(r) for r in rows], "total": total, "limit": limit, "offset": offset})
@@ -503,7 +503,7 @@ def search_faces():
     c.execute("SELECT id, name, description, is_celebrity, original_price, ai_declaration, usage_count FROM faces WHERE status='active' AND name LIKE %s LIMIT %s OFFSET %s", (pattern, limit, offset))
     rows = c.fetchall()
     c.execute("SELECT COUNT(*) FROM faces WHERE status='active' AND name LIKE %s", (pattern,))
-    total = dict(c.fetchone())['count']
+    total = dict_from_row(c.fetchone())['count']
     conn.close()
     return jsonify({"faces": [dict(r) for r in rows], "total": total, "limit": limit, "offset": offset, "query": q})
 
@@ -581,14 +581,14 @@ def stats():
     try:
         conn, c, is_pg = get_db_conn()
         c.execute("SELECT COUNT(*) FROM faces WHERE status='active'")
-        fc = dict(c.fetchone())['count']
+        fc = dict_from_row(c.fetchone())['count']
         c.execute("SELECT COUNT(*) FROM works WHERE status='active'")
-        wc = dict(c.fetchone())['count']
+        wc = dict_from_row(c.fetchone())['count']
         c.execute("SELECT SUM(usage_count) FROM faces")
-        fu = dict(c.fetchone()).get('sum') or 0
+        fu = dict_from_row(c.fetchone()).get('sum') or 0
         wu = 0  # works table has no usage_count column
         c.execute("SELECT SUM(platform_fee) FROM revenues")
-        pr = dict(c.fetchone()).get('sum') or 0
+        pr = dict_from_row(c.fetchone()).get('sum') or 0
         conn.close()
         return jsonify({"faces": fc, "works": wc, "uses": fu+wu, "platform_revenue": pr, "fee_rate": "1%"})
     except Exception as e:
@@ -605,10 +605,10 @@ def my_uploads():
     c.execute("SELECT * FROM works WHERE uploader_id=%s", (u['id'],))
     ws = [dict(r) for r in c.fetchall()]
     c.execute("SELECT SUM(amount-platform_fee) FROM revenues WHERE uploader_id=%s", (u['id'],))
-    earn = dict(c.fetchone()).get('sum') or 0
+    earn = dict_from_row(c.fetchone()).get('sum') or 0
     # 获取余额
     c.execute("SELECT balance FROM users WHERE id=%s", (u['id'],))
-    balance = dict(c.fetchone())['balance']
+    balance = dict_from_row(c.fetchone())['balance']
     conn.close()
     return jsonify({"faces": fs, "works": ws, "earnings": earn, "balance": balance})
 
@@ -833,7 +833,7 @@ def debug_test_query():
     try:
         conn, c, is_pg = get_db_conn()
         c.execute("SELECT COUNT(*) FROM users WHERE username=%s", ("nonexistent",))
-        r = dict(c.fetchone())
+        r = dict_from_row(c.fetchone())
         conn.close()
         return jsonify({"works": True, "result": r})
     except Exception as e:
