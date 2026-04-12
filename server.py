@@ -1881,6 +1881,45 @@ def send_alert():
     })
 
 
+def _create_admin_user(username, email, password):
+    """Create an admin user directly in the database. Returns result string."""
+    try:
+        conn, c, is_pg = get_db_conn()
+
+        # Check if user already exists
+        c.execute("SELECT id FROM users WHERE username=%s", (username,))
+        if c.fetchone():
+            conn.close()
+            return f"Admin user '{username}' already exists"
+
+        # Generate password hash and API key
+        import hashlib, secrets
+        password_hash = hashlib.sha256(password.encode()).hexdigest()
+        api_key = secrets.token_hex(32)
+
+        # Insert user with is_admin=TRUE
+        if is_pg:
+            c.execute(
+                "INSERT INTO users (username, password_hash, api_key, balance, is_admin, email, verified) "
+                "VALUES (%s, %s, %s, 0, TRUE, %s, 1)",
+                (username, password_hash, api_key, email)
+            )
+        else:
+            c.execute(
+                "INSERT INTO users (username, password_hash, api_key, balance, is_admin, email, verified) "
+                "VALUES (?, ?, ?, 0, 1, ?, 1)",
+                (username, password_hash, api_key, email)
+            )
+
+        conn.commit()
+        conn.close()
+        return f"Admin user '{username}' created with API key: {api_key}"
+    except Exception as e:
+        import traceback
+        logger.error(f"Failed to create admin user: {e}\n{traceback.format_exc()}")
+        return f"Failed to create admin user: {str(e)}"
+
+
 # =============================================================================
 # Database Migration Endpoint (for setting up new tables)
 # =============================================================================
@@ -2073,6 +2112,15 @@ def admin_init_db():
 
         conn.commit()
         conn.close()
+
+        # 6. Optionally create admin user
+        data = request.json or {}
+        if data.get('create_admin'):
+            admin_username = data.get('admin_username', 'admin')
+            admin_email = data.get('admin_email', 'admin@portraitpayai.com')
+            admin_password = data.get('admin_password', 'PortraitPay2026!')
+            admin_result = _create_admin_user(admin_username, admin_email, admin_password)
+            results.append(admin_result)
 
         return jsonify({
             "success": True,
