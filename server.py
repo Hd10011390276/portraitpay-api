@@ -1891,11 +1891,20 @@ def admin_init_db():
     Initialize/upgrade database schema.
     Creates portrait_fingerprints, search_queries tables and adds columns to faces.
     This is a one-time setup endpoint.
+
+    Auth: Either admin user with X-API-Key, or X-INIT-SECRET header matching env var.
     """
-    api_key = request.headers.get('X-API-Key')
-    user = get_user(api_key)
-    if not user or not user.get('is_admin'):
-        return jsonify({"error": "需要管理员权限"}), 403
+    # Check for secret key auth (for initial setup without admin user)
+    init_secret = request.headers.get('X-INIT-SECRET')
+    expected_secret = os.environ.get('DB_INIT_SECRET', 'portraitpay-init-2026')
+    if init_secret == expected_secret:
+        pass  # Authorized via secret
+    else:
+        # Check for admin user auth
+        api_key = request.headers.get('X-API-Key')
+        user = get_user(api_key)
+        if not user or not user.get('is_admin'):
+            return jsonify({"error": "需要管理员权限"}), 403
 
     try:
         conn, c, is_pg = get_db_conn()
