@@ -1555,17 +1555,17 @@ def admin_stats():
     conn, c, is_pg = get_db_conn()
 
     c.execute("SELECT COUNT(*) as total FROM faces WHERE status='active'")
-    total_faces = dict(c.fetchone())['count']
+    total_faces = dict_from_row(c.fetchone())['total']
 
     c.execute("SELECT COUNT(*) as total FROM users")
-    total_users = dict(c.fetchone())['count']
+    total_users = dict_from_row(c.fetchone())['total']
 
     c.execute("SELECT COUNT(*) as total FROM portrait_fingerprints")
-    total_fingerprints = dict(c.fetchone())['count']
+    total_fingerprints = dict_from_row(c.fetchone())['total']
 
     c.execute("SELECT SUM(results_count) as total FROM search_queries")
-    result = c.fetchone()
-    total_searches = dict(result)['total'] or 0 if result else 0
+    result = dict_from_row(c.fetchone())
+    total_searches = result['total'] or 0 if result else 0
 
     conn.close()
 
@@ -1583,8 +1583,8 @@ def health_local_first():
     """Health check for Local-First API."""
     conn, c, is_pg = get_db_conn()
     c.execute("SELECT COUNT(*) as fp_count FROM portrait_fingerprints")
-    result = c.fetchone()
-    fp_count = dict(result)['count'] if result else 0
+    result = dict_from_row(c.fetchone())
+    fp_count = result['fp_count'] if result else 0
     conn.close()
 
     return jsonify({
