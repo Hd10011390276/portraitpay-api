@@ -1913,11 +1913,12 @@ def _create_admin_user(username, email, password):
 
         conn.commit()
         conn.close()
-        return f"Admin user '{username}' created with API key: {api_key}"
+        logger.info(f"Admin user '{username}' created")
+        return {"message": f"Admin user '{username}' created", "api_key": api_key, "username": username}
     except Exception as e:
         import traceback
         logger.error(f"Failed to create admin user: {e}\n{traceback.format_exc()}")
-        return f"Failed to create admin user: {str(e)}"
+        return {"message": f"Failed to create admin user: {str(e)}", "error": str(e)}
 
 
 # =============================================================================
@@ -2115,19 +2116,27 @@ def admin_init_db():
 
         # 6. Optionally create admin user
         data = request.json or {}
+        admin_api_key = None
         if data.get('create_admin'):
             admin_username = data.get('admin_username', 'admin')
             admin_email = data.get('admin_email', 'admin@portraitpayai.com')
             admin_password = data.get('admin_password', 'PortraitPay2026!')
             admin_result = _create_admin_user(admin_username, admin_email, admin_password)
-            results.append(admin_result)
+            if isinstance(admin_result, dict):
+                results.append(admin_result['message'])
+                admin_api_key = admin_result.get('api_key')
+            else:
+                results.append(str(admin_result))
 
-        return jsonify({
+        response = {
             "success": True,
             "message": "Database migration completed",
             "results": results,
             "is_pg": is_pg
-        })
+        }
+        if admin_api_key:
+            response["admin_api_key"] = admin_api_key
+        return jsonify(response)
 
     except Exception as e:
         import traceback
