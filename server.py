@@ -1249,15 +1249,7 @@ def register_faceapi_embedding():
     Browser extracts 128-dim face embedding using face-api.js,
     sends ONLY the embedding vector to server. Original image never leaves browser.
 
-    Request body:
-    {
-        "name": "User Name",
-        "embedding": "base64_encoded_float32array_128dim",
-        "device_id": "optional_device_identifier",
-        "price": 0,
-        "ai_declaration": 1,
-        "copyright_info": "optional text"
-    }
+    Works with Railway PostgreSQL schema: embedding stored in faces.embedding column.
     """
     api_key = request.headers.get('X-API-Key')
     user = get_user(api_key)
@@ -1267,17 +1259,15 @@ def register_faceapi_embedding():
     data = request.json
     name = data.get('name', '').strip()
     embedding_b64 = data.get('embedding', '').strip()
-    local_device_id = data.get('device_id', '')
-    price = data.get('price', 0)
-    ai_declaration = data.get('ai_declaration', 0)
+    device_id = data.get('device_id', '')
+    price = float(data.get('price', 0))
+    ai_declaration = 1 if data.get('ai_declaration') else 0
     copyright_info = data.get('copyright_info', '')
 
     if not name:
         return jsonify({"error": "请提供姓名/艺名"}), 400
     if not embedding_b64:
         return jsonify({"error": "请提供人脸特征向量"}), 400
-    if not ai_declaration:
-        return jsonify({"error": "必须声明非AI生成肖像"}), 400
 
     # Validate embedding size
     try:
@@ -1289,43 +1279,58 @@ def register_faceapi_embedding():
         return jsonify({"error": "特征向量格式无效"}), 400
 
     conn, c, is_pg = get_db_conn()
+    user_id = user['id']
 
-    # Debug: check faces columns
+    # Check existing faces columns (for debugging)
     if is_pg:
         c.execute("SELECT column_name FROM information_schema.columns WHERE table_name='faces' AND table_schema='public'")
         cols = [dict_from_row(r)['column_name'] for r in c.fetchall()]
-        logger.info(f"Faces table columns: {cols}")
+        has_uploader_id = 'uploader_id' in cols
+        has_embedding = 'embedding' in cols
+        logger.info(f"Faces columns: {cols}, has_uploader={has_uploader_id}, has_embedding={has_embedding}")
 
-    # Check if user already has a face
-    c.execute("SELECT id FROM faces WHERE uploader_id=%s", (user['id'],))
-    if c.fetchone():
-        conn.close()
-        return jsonify({"error": "每位用户只能注册一张肖像"}), 400
+        if has_uploader_id:
+            c.execute("SELECT id FROM faces WHERE uploader_id=%s", (user_id,))
+        else:
+            c.execute("SELECT id FROM faces WHERE hash_id=%s", (f"user_{user_id}",))
+        if c.fetchone():
+            conn.close()
+            return jsonify({"error": "每位用户只能注册一张肖像"}), 400
 
-    hash_id = hashlib.sha256(f"{name}{user['id']}{time.time()}".encode()).hexdigest()[:16]
+        hash_id = hashlib.sha256(f"{name}{user_id}{time.time()}".encode()).hexdigest()[:16]
 
-    # Insert face record
-    c.execute('''INSERT INTO faces (name, hash_id, is_celebrity, uploader_id, original_price, ai_declaration, copyright_info, age, fingerprint_registered, local_device_id)
-                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
-             (name, hash_id, 0, user['id'], price, ai_declaration, copyright_info, 18, 1, local_device_id))
+        if has_embedding:
+            # Railway schema: store embedding directly in faces.embedding
+            c.execute('''INSERT INTO faces (name, hash_id, embedding, model, status, is_celebrity, original_price, ai_declaration, copyright_info, fingerprint_registered, local_device_id)
+                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
+                     (name, hash_id, embedding_b64, 'faceapi_128dim', 'active', 0, price, ai_declaration, copyright_info, 1, device_id))
+        else:
+            # Fallback: insert without embedding column
+            c.execute('''INSERT INTO faces (name, hash_id, status, is_celebrity, original_price, ai_declaration, copyright_info, fingerprint_registered, local_device_id)
+                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)''',
+                     (name, hash_id, 'active', 0, price, ai_declaration, copyright_info, 1, device_id))
+    else:
+        # SQLite fallback
+        c.execute("SELECT id FROM faces WHERE uploader_id=%s", (user_id,))
+        if c.fetchone():
+            conn.close()
+            return jsonify({"error": "每位用户只能注册一张肖像"}), 400
+        hash_id = hashlib.sha256(f"{name}{user_id}{time.time()}".encode()).hexdigest()[:16]
+        c.execute('''INSERT INTO faces (name, hash_id, is_celebrity, uploader_id, original_price, ai_declaration, copyright_info, age, fingerprint_registered, local_device_id)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                 (name, hash_id, 0, user_id, price, ai_declaration, copyright_info, 18, 1, device_id))
+
     conn.commit()
     face_id = last_insert_id(conn, c, is_pg)
-
-    # Store embedding (as base64 string for PostgreSQL compatibility)
-    model_name = 'faceapi_128dim'
-    c.execute('''INSERT INTO face_embeddings (face_id, embedding, model_name)
-                 VALUES (%s, %s, %s)''',
-             (face_id, embedding_b64, model_name))
-    conn.commit()
     conn.close()
 
-    logger.info(f"Face embedding registered for user {user['id']}, face_id={face_id}, dim=128")
+    logger.info(f"Face embedding registered for user {user_id}, face_id={face_id}, dim=128")
     return jsonify({
         "success": True,
         "face_id": face_id,
         "hash_id": hash_id,
         "embedding_dim": 128,
-        "model": model_name,
+        "model": "faceapi_128dim",
         "message": "人脸特征注册成功！"
     })
 
@@ -1337,14 +1342,7 @@ def search_portrait_by_embedding():
     Browser extracts face embedding, sends to server.
     Server computes cosine similarity against stored embeddings.
 
-    Request body:
-    {
-        "embedding": "base64_encoded_float32array_128dim",
-        "threshold": 0.6,   // minimum cosine similarity (default 0.6)
-        "limit": 5
-    }
-
-    Returns matched faces sorted by cosine similarity.
+    Works with both: face_embeddings table and faces.embedding column (Railway schema).
     """
     data = request.json
     embedding_b64 = data.get('embedding', '').strip()
@@ -1354,7 +1352,6 @@ def search_portrait_by_embedding():
     if not embedding_b64:
         return jsonify({"error": "请提供人脸特征向量"}), 400
 
-    import base64
     try:
         embedding_bytes = base64.b64decode(embedding_b64)
         query_vec = list(struct.unpack('128f', embedding_bytes[:512]))  # 128 floats
@@ -1362,54 +1359,86 @@ def search_portrait_by_embedding():
         return jsonify({"error": "特征向量格式无效"}), 400
 
     conn, c, is_pg = get_db_conn()
-    c.execute("""
-        SELECT fe.face_id, fe.embedding, fe.model_name,
-               f.name, f.is_celebrity, f.original_price, f.copyright_info,
-               f.ai_declaration, f.status
-        FROM face_embeddings fe
-        JOIN faces f ON fe.face_id = f.id
-        WHERE f.status = 'active' AND fe.model_name = 'faceapi_128dim'
-    """)
-    rows = c.fetchall()
-    conn.close()
-
     matches = []
-    for row in rows:
-        try:
-            stored_b64 = dict(row)['embedding']
-            stored_bytes = base64.b64decode(stored_b64)
-            stored_vec = list(struct.unpack('128f', stored_bytes[:512]))
 
-            # Cosine similarity
-            dot = sum(a * b for a, b in zip(query_vec, stored_vec))
-            norm_q = math.sqrt(sum(a * a for a in query_vec))
-            norm_s = math.sqrt(sum(a * a for a in stored_vec))
-            similarity = dot / (norm_q * norm_s + 1e-8)
+    def cosine_search(rows):
+        results = []
+        for row in rows:
+            try:
+                row_dict = dict_from_row(row)
+                stored_b64 = row_dict['embedding']
+                if not stored_b64:
+                    continue
+                stored_bytes = base64.b64decode(stored_b64)
+                stored_vec = list(struct.unpack('128f', stored_bytes[:512]))
+                dot = sum(a * b for a, b in zip(query_vec, stored_vec))
+                norm_q = math.sqrt(sum(a * a for a in query_vec))
+                norm_s = math.sqrt(sum(a * a for a in stored_vec))
+                similarity = dot / (norm_q * norm_s + 1e-8)
+                if similarity >= threshold:
+                    status = row_dict.get('status', 'active')
+                    ai_decl = row_dict.get('ai_declaration', 1)
+                    if status != 'active':
+                        auth_status = 'unavailable'
+                    elif ai_decl == 0:
+                        auth_status = 'pending_review'
+                    else:
+                        auth_status = 'available'
+                    results.append({
+                        'face_id': row_dict['id'],
+                        'name': row_dict.get('name', ''),
+                        'is_celebrity': bool(row_dict.get('is_celebrity', 0)),
+                        'similarity': round(float(similarity), 4),
+                        'similarity_pct': round(float(similarity) * 100, 1),
+                        'authorization_status': auth_status,
+                        'price': row_dict.get('original_price') or 0,
+                        'copyright_info': row_dict.get('copyright_info', ''),
+                        'model': row_dict.get('model', 'faceapi_128dim')
+                    })
+            except Exception as e:
+                logger.warning(f"Compare error: {e}")
+                continue
+        return results
 
-            if similarity >= threshold:
-                row_dict = dict(row)
-                if row_dict['status'] != 'active':
-                    auth_status = 'unavailable'
-                elif row_dict['ai_declaration'] == 0:
-                    auth_status = 'pending_review'
-                else:
-                    auth_status = 'available'
+    # Try face_embeddings table first
+    try:
+        c.execute("""
+            SELECT fe.face_id as id, fe.embedding, fe.model_name as model,
+                   f.name, f.is_celebrity, f.original_price, f.copyright_info,
+                   f.ai_declaration, f.status
+            FROM face_embeddings fe
+            JOIN faces f ON fe.face_id = f.id
+            WHERE f.status = 'active' AND fe.model_name = 'faceapi_128dim'
+        """)
+        rows = c.fetchall()
+        if rows:
+            matches.extend(cosine_search(rows))
+    except Exception as e:
+        logger.warning(f"face_embeddings search failed: {e}")
 
-                matches.append({
-                    'face_id': row_dict['face_id'],
-                    'name': row_dict['name'],
-                    'is_celebrity': bool(row_dict['is_celebrity']),
-                    'similarity': round(float(similarity), 4),
-                    'similarity_pct': round(float(similarity) * 100, 1),
-                    'authorization_status': auth_status,
-                    'price': row_dict['original_price'] or 0,
-                    'copyright_info': row_dict.get('copyright_info', ''),
-                    'model': row_dict['model_name']
-                })
-        except Exception as e:
-            logger.warning(f"Failed to compare embedding for face_id {dict(row).get('face_id')}: {e}")
-            continue
+    # Also search faces.embedding column directly (Railway schema)
+    try:
+        if is_pg:
+            c.execute("""
+                SELECT id, name, embedding, model, is_celebrity, original_price,
+                       copyright_info, ai_declaration, status
+                FROM faces
+                WHERE status = 'active' AND embedding IS NOT NULL AND model = 'faceapi_128dim'
+            """)
+        else:
+            c.execute("""
+                SELECT id, name, embedding, model, is_celebrity, original_price,
+                       copyright_info, ai_declaration, status
+                FROM faces
+                WHERE status = 'active' AND embedding IS NOT NULL AND model = 'faceapi_128dim'
+            """)
+        rows = c.fetchall()
+        if rows:
+            matches.extend(cosine_search(rows))
+    except Exception as e:
+        logger.warning(f"faces.embedding search failed: {e}")
 
+    conn.close()
     matches.sort(key=lambda x: x['similarity'], reverse=True)
     matches = matches[:limit]
 
