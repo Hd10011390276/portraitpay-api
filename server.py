@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """PortraitPay AI Backend - 肖像版权数据库系统"""
 
-import os, json, sqlite3, hashlib, time, secrets, logging, smtplib, random, string, base64, io
+import os, json, sqlite3, hashlib, time, secrets, logging, smtplib, random, string, base64, io, math, struct
 from datetime import datetime
 from pathlib import Path
 import portrait_db as db_module
@@ -1239,6 +1239,180 @@ def register_portrait_fingerprint():
         "face_id": face_id,
         "hash_id": hash_id,
         "message": "肖像指纹注册成功！其他用户现在可以查询您的授权状态"
+    })
+
+
+@app.route('/api/portrait/register-face-embedding', methods=['POST'])
+def register_face_embedding():
+    """
+    Register a face embedding (Local-First, real face recognition).
+    Browser extracts 128-dim face embedding using face-api.js,
+    sends ONLY the embedding vector to server. Original image never leaves browser.
+
+    Request body:
+    {
+        "name": "User Name",
+        "embedding": "base64_encoded_float32array_128dim",
+        "device_id": "optional_device_identifier",
+        "price": 0,
+        "ai_declaration": 1,
+        "copyright_info": "optional text"
+    }
+    """
+    api_key = request.headers.get('X-API-Key')
+    user = get_user(api_key)
+    if not user:
+        return jsonify({"error": "请先登录"}), 401
+
+    data = request.json
+    name = data.get('name', '').strip()
+    embedding_b64 = data.get('embedding', '').strip()
+    local_device_id = data.get('device_id', '')
+    price = data.get('price', 0)
+    ai_declaration = data.get('ai_declaration', 0)
+    copyright_info = data.get('copyright_info', '')
+
+    if not name:
+        return jsonify({"error": "请提供姓名/艺名"}), 400
+    if not embedding_b64:
+        return jsonify({"error": "请提供人脸特征向量"}), 400
+    if not ai_declaration:
+        return jsonify({"error": "必须声明非AI生成肖像"}), 400
+
+    # Validate embedding size
+    try:
+        embedding_bytes = base64.b64decode(embedding_b64)
+        embedding_len = len(embedding_bytes) // 4  # Float32 = 4 bytes
+        if embedding_len != 128:
+            return jsonify({"error": f"特征向量维度必须是128，当前为{embedding_len}"}), 400
+    except Exception:
+        return jsonify({"error": "特征向量格式无效"}), 400
+
+    conn, c, is_pg = get_db_conn()
+
+    # Check if user already has a face
+    c.execute("SELECT id FROM faces WHERE uploader_id=%s", (user['id'],))
+    if c.fetchone():
+        conn.close()
+        return jsonify({"error": "每位用户只能注册一张肖像"}), 400
+
+    hash_id = hashlib.sha256(f"{name}{user['id']}{time.time()}".encode()).hexdigest()[:16]
+
+    # Insert face record
+    c.execute('''INSERT INTO faces (name, hash_id, is_celebrity, uploader_id, original_price, ai_declaration, copyright_info, age, fingerprint_registered, local_device_id)
+                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
+             (name, hash_id, 0, user['id'], price, ai_declaration, copyright_info, 18, 1, local_device_id))
+    conn.commit()
+    face_id = last_insert_id(conn, c, is_pg)
+
+    # Store embedding (as base64 string for PostgreSQL compatibility)
+    model_name = 'faceapi_128dim'
+    c.execute('''INSERT INTO face_embeddings (face_id, embedding, model_name)
+                 VALUES (%s, %s, %s)''',
+             (face_id, embedding_b64, model_name))
+    conn.commit()
+    conn.close()
+
+    logger.info(f"Face embedding registered for user {user['id']}, face_id={face_id}, dim=128")
+    return jsonify({
+        "success": True,
+        "face_id": face_id,
+        "hash_id": hash_id,
+        "embedding_dim": 128,
+        "model": model_name,
+        "message": "人脸特征注册成功！"
+    })
+
+
+@app.route('/api/portrait/search-by-embedding', methods=['POST'])
+def search_portrait_by_embedding():
+    """
+    Search for a face by 128-dim embedding (Local-First).
+    Browser extracts face embedding, sends to server.
+    Server computes cosine similarity against stored embeddings.
+
+    Request body:
+    {
+        "embedding": "base64_encoded_float32array_128dim",
+        "threshold": 0.6,   // minimum cosine similarity (default 0.6)
+        "limit": 5
+    }
+
+    Returns matched faces sorted by cosine similarity.
+    """
+    data = request.json
+    embedding_b64 = data.get('embedding', '').strip()
+    threshold = float(data.get('threshold', 0.6))
+    limit = min(int(data.get('limit', 5)), 20)
+
+    if not embedding_b64:
+        return jsonify({"error": "请提供人脸特征向量"}), 400
+
+    import base64
+    try:
+        embedding_bytes = base64.b64decode(embedding_b64)
+        query_vec = list(struct.unpack('128f', embedding_bytes[:512]))  # 128 floats
+    except Exception:
+        return jsonify({"error": "特征向量格式无效"}), 400
+
+    conn, c, is_pg = get_db_conn()
+    c.execute("""
+        SELECT fe.face_id, fe.embedding, fe.model_name,
+               f.name, f.is_celebrity, f.original_price, f.copyright_info,
+               f.ai_declaration, f.status
+        FROM face_embeddings fe
+        JOIN faces f ON fe.face_id = f.id
+        WHERE f.status = 'active' AND fe.model_name = 'faceapi_128dim'
+    """)
+    rows = c.fetchall()
+    conn.close()
+
+    matches = []
+    for row in rows:
+        try:
+            stored_b64 = dict(row)['embedding']
+            stored_bytes = base64.b64decode(stored_b64)
+            stored_vec = list(struct.unpack('128f', stored_bytes[:512]))
+
+            # Cosine similarity
+            dot = sum(a * b for a, b in zip(query_vec, stored_vec))
+            norm_q = math.sqrt(sum(a * a for a in query_vec))
+            norm_s = math.sqrt(sum(a * a for a in stored_vec))
+            similarity = dot / (norm_q * norm_s + 1e-8)
+
+            if similarity >= threshold:
+                row_dict = dict(row)
+                if row_dict['status'] != 'active':
+                    auth_status = 'unavailable'
+                elif row_dict['ai_declaration'] == 0:
+                    auth_status = 'pending_review'
+                else:
+                    auth_status = 'available'
+
+                matches.append({
+                    'face_id': row_dict['face_id'],
+                    'name': row_dict['name'],
+                    'is_celebrity': bool(row_dict['is_celebrity']),
+                    'similarity': round(float(similarity), 4),
+                    'similarity_pct': round(float(similarity) * 100, 1),
+                    'authorization_status': auth_status,
+                    'price': row_dict['original_price'] or 0,
+                    'copyright_info': row_dict.get('copyright_info', ''),
+                    'model': row_dict['model_name']
+                })
+        except Exception as e:
+            logger.warning(f"Failed to compare embedding for face_id {dict(row).get('face_id')}: {e}")
+            continue
+
+    matches.sort(key=lambda x: x['similarity'], reverse=True)
+    matches = matches[:limit]
+
+    return jsonify({
+        "matches": matches,
+        "total": len(matches),
+        "query_embedding_dim": 128,
+        "threshold": threshold,
+        "message": "查询成功" if matches else "未找到匹配的肖像"
     })
 
 
